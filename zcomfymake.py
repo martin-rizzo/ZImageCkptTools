@@ -1,6 +1,6 @@
 """
 File    : convmodel.py
-Purpose : Script to convert the original Z-Image model to a format compatible with ComfyUI
+Purpose : Script to convert the original Z-Image checkpoint to a format compatible with ComfyUI
 Author  : Martin Rizzo | <martinrizzo@gmail.com>
 Date    : Jun 26, 2026
 Repo    : https://github.com/martin-rizzo/ComfyUI-ZImagePowerNodes
@@ -21,11 +21,13 @@ from typing import IO
 if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv):
     # modules that are not available in the standard library are imported here
     import numpy as np
-    from numpy import ndarray
-    from typing import Callable
     import ml_dtypes
+    from typing      import Callable, Any
     from safetensors import safe_open
 
+# Safetensors Header Structure
+# each tensor name maps to a dictionary containing its metadata
+type SafetensorsHeader = dict[str, dict[str, Any]]
 
 
 # get the directory where the script is located
@@ -48,33 +50,30 @@ def disable_colors():
     RED, DKRED, YELLOW, DKYELLOW, GREEN, CYAN, DKGRAY, RESET = "", "", "", "", "", "", "", ""
 
 
-def info(message: str, padding: int = 0, file=sys.stderr) -> None:
-    """Displays an informational message to the error stream.
-    """
-    print(f"{{{' '*padding}}}{CYAN}\u24d8 {message}{RESET}", file=file)
+def message(msg: str, *extra_messages: str, padding: int = 0, file=sys.stderr) -> None:
+    """Displays a regular message with custom padding."""
+    pad_spaces = " " * padding
+    if msg:
+        print(f"{pad_spaces}{GREEN}>{RESET} {msg}", end="", file=file)
+        for extra in extra_messages:
+            print(f" {extra}", end="", file=file)
+    print(file=file)
 
 
-def warning(message: str, *info_messages: str, padding: int = 0, file=sys.stderr) -> None:
-    """Displays a warning message to the standard error stream.
-    """
-    print(f"{{{' '*padding}}}{CYAN}[{YELLOW}WARNING{CYAN}]{DKYELLOW} {message}{RESET}", file=file)
+def warning(msg: str, *info_messages: str, padding: int = 0, file=sys.stderr) -> None:
+    """Displays a warning message and its info messages with custom padding."""
+    pad_spaces = " " * padding
+    print(f"{pad_spaces}{CYAN}[{YELLOW}WARNING{CYAN}]{YELLOW} {msg}{RESET}", file=file)
     for info_message in info_messages:
-        info(info_message, padding=padding, file=file)
+        print(f"{pad_spaces} {CYAN}\xF0\x9F\x9B\x88 {info_message}{RESET}", file=file)
 
 
-def error(message: str, *info_messages: str, padding: int = 0, file=sys.stderr) -> None:
-    """Displays an error message to the standard error stream.
-    """
-    print(f"{{{' '*padding}}}{DKRED}[{RED}ERROR!{DKRED}]{DKYELLOW} {message}{RESET}", file=file)
+def error(msg: str, *info_messages: str, padding: int = 0, file=sys.stderr) -> None:
+    """Displays an error message and its info messages with custom padding."""
+    pad_spaces = " " * padding
+    print(f"{pad_spaces}{CYAN}[{RED}ERROR{CYAN}]{RED} {msg}{RESET}", file=file)
     for info_message in info_messages:
-        info(info_message, padding=padding, file=file)
-
-
-def fatal_error(message: str, *info_messages: str, padding: int = 0, file=sys.stderr) -> None:
-    """Displays a fatal error message to the standard error stream and exits with status code 1.
-    """
-    error(message, *info_messages, padding=padding, file=file)
-    sys.exit(1)
+        print(f"{pad_spaces} {CYAN}\xF0\x9F\x9B\x88 {info_message}{RESET}", file=file)
 
 
 #============================== PROGRESS BAR ===============================#
@@ -185,22 +184,27 @@ class TensorMapper:
 
 
 def build_safetensors(output_safetensors_path: Path | str,
-                      input_tensor_file      : IO[bytes],
+                      input_rawtensor_file   : IO[bytes],
                       *,
-                      header   : dict[str, dict],
+                      header   : SafetensorsHeader,
                       alignment: int = 64,
+                      progress: ProgressBar | None = None
                       ):
     """
-    Combines the JSON metadata header and the raw binary tensor data into a 
-    valid single .safetensors file.
+    Combines the metadata header and the raw binary tensor data into a valid
+    single .safetensors file.
 
     Args:
         output_safetensors_path : Path where the final .safetensors file will be saved.
-        input_tensor_file       : An open file-like object (in 'rb' or 'w+b' mode) containing the tensors.
-        header                  : The dictionary containing the metadata of the tensors.
+        input_rawtensor_file    : An open file-like object (in rb or w+b mode) containing
+                                  raw tensor data generated with `write_rawtensor_file(..)`.
+        header                  : Dictionary containing the metadata of each tensors.
         alignment               : Byte alignment required for the start of the data buffer.
+        progress                : An optional progress bar object to track the
+                                  writing progress.
     """
     HEADER_START_OFFSET = 8
+    COPY_CHUNK_SIZE = 1024 * 1024
 
     # convert the header to a clean JSON string
     header_str   = json.dumps(header, separators=(",", ":"))
@@ -219,35 +223,56 @@ def build_safetensors(output_safetensors_path: Path | str,
     with open(output_safetensors_path, "wb") as f_out:
         f_out.write(header_size)
         f_out.write(header_bytes)
-        while chunk := input_tensor_file.read(64 * 1024):  # chunks of 64KB
+
+        # calculate total size for progress tracking
+        total_size   = input_rawtensor_file.seek(0, 2)
+        written_size = 0
+        input_rawtensor_file.seek(0)
+        while chunk := input_rawtensor_file.read(COPY_CHUNK_SIZE):
             f_out.write(chunk)
+            written_size += len(chunk)
+            if progress is not None:
+                progress.update(written_size / total_size)
 
 
-def write_binary_tensor_file(output_tensor_rawfile: IO[bytes],
-                             input_file_paths     : list[Path | str],
-                             *,
-                             cast_to    : str,
-                             transform  : Callable    | None = None,
-                             progress   : ProgressBar | None = None
-                             ) -> dict[str, dict]:
+def write_rawtensor_file(output_rawtensor_file: IO[bytes],
+                         input_file_paths     : list[Path | str],
+                         *,
+                         cast_to      : str,
+                         tensor_mapper: Callable    | None = None,
+                         progress     : ProgressBar | None = None
+                         ) -> SafetensorsHeader:
     """
-    Process tensors, cast them to bfloat16, and prepare binary data and header metadata.
+    Process tensors, cast them, and prepare binary data and header metadata for
+    future safetensors creation.
 
     Args:
-        output_file : Path to the output binary file.
-        input_files : List of paths to input .safetensors files.
-        cast_to     : Target format (e.g., 'bf16').
-        progress    : Optional progress tracker object.
+        output_rawtensor_file: A binary file object where the processed tensor
+                               data will be written.
+        input_file_paths     : A list of paths to the input source files.
+        cast_to              : The target data type string (e.g., "f32", "f16", "bf16").
+        tensor_mapper        : An optional callable that takes (tensor_name, tensor)
+                               as input and returns a tuple of (new_name, new_tensor),
+                               used for custom transformations or filtering.
+        progress             : An optional progress bar object to track the
+                               processing status.
+
     Returns:
-        A dictionary containing the metadata header for safetensors.
+        A dictionary (SafetensorsHeader) containing the metadata header structured
+        for safetensors compatibility, mapping tensor names to their respective
+        dtype, shape, and byte offsets.
     """
-    if cast_to.lower() != "bf16":
-        raise ValueError("Only bf16 is supported for now.")
+    cast_to = cast_to.upper()
+    if   cast_to in ("F32","FP32","FLOAT32"): st_dtype, dtype = "F32" , np.float32
+    elif cast_to in ("F16","FP16","FLOAT16"): st_dtype, dtype = "F16" , np.float16
+    elif cast_to in ("BF16")                : st_dtype, dtype = "BF16", ml_dtypes.bfloat16
+    else:
+        raise ValueError(f"Invalid cast_to value: {cast_to}")
 
     # start from offset 0 as it is assumed that the raw binary information
     # will be aligned when the final .safetensors is created
     current_offset = 0
-    header = {}
+    header: SafetensorsHeader = {}
 
     # validate that all input files exist before starting the process
     for input_file in input_file_paths:
@@ -260,36 +285,38 @@ def write_binary_tensor_file(output_tensor_rawfile: IO[bytes],
             total = len(keys)
 
             for i, tensor_name in enumerate(keys):
+                tensor : np.ndarray | None = f_in.get_tensor(tensor_name)
+                if tensor is None:
+                    continue
 
-                # read tensor and apply transformation
-                tensor = f_in.get_tensor(tensor_name)
-                if transform is not None:
-                    tensor_name, tensor = transform(tensor_name, tensor)
+                # apply mapping/transformation to tensor
+                if tensor_mapper is not None:
+                    tensor_name, tensor = tensor_mapper(tensor_name, tensor)
                 if not tensor_name or tensor is None:
                     continue
 
                 # convert tensor to raw bytes
-                tensor       = tensor.astype(np.dtype(ml_dtypes.bfloat16))
+                tensor       = tensor.astype(np.dtype(dtype))
                 tensor_bytes = tensor.tobytes()
-                start        = current_offset
-                end          = start + len(tensor_bytes)
+                st_start     = current_offset
+                st_end       = st_start + len(tensor_bytes)
+                st_shape     = list(tensor.shape)
 
                 # record metadata for the header
                 header[tensor_name] = {
-                    "dtype"       : "BF16",
-                    "shape"       : list(tensor.shape), #< list to ensure JSON compatibility
-                    "data_offsets": [start, end]
+                    "dtype"       : st_dtype,
+                    "shape"       : st_shape,
+                    "data_offsets": [st_start, st_end]
                 }
 
                 # write raw bytes
-                output_tensor_rawfile.write(tensor_bytes)
-                current_offset = end
+                output_rawtensor_file.write(tensor_bytes)
+                current_offset = st_end
 
                 if progress is not None:
                     progress.update((i + 1) / total)
 
     return header
-
 
 
 #===========================================================================#
@@ -311,46 +338,55 @@ def main(args=None, parent_script=None):
         prog            = prog,
         description     = "Convert and merge original diffusion model weights to ComfyUI format.",
         formatter_class = argparse.RawTextHelpFormatter,
-        )
-    parser.add_argument('-o', '--output', default='output.safetensors', help="Output safetensors file path.")
-    parser.add_argument('-l', '--low-ram', action="store_true", help="Write temporary data to disk instead of RAM, useful for low-memory environments.")
+    )
+
     parser.add_argument('input_files', nargs='+', metavar='INPUT', help="One or more input safetensors files to process.")
+    parser.add_argument('-o', '--output', default='z_image_turbo.safetensors', help="Output safetensors file path.")
+    parser.add_argument('-l', '--low-ram', action="store_true", help="Write temporary data to disk instead of RAM, useful for low-memory environments.")
+    # mutually exclusive group for precision arguments
+    precision_group = parser.add_mutually_exclusive_group()
+    precision_group.add_argument('--bf16', action='store_const', const='BF16', dest='dtype', help="Set output precision to BF16 (default).")
+    precision_group.add_argument('--fp16', action='store_const', const='FP16', dest='dtype', help="Set output precision to F16.")
+    precision_group.add_argument('--fp32', action='store_const', const='FP32', dest='dtype', help="Set output precision to F32.")
+    parser.set_defaults(dtype='BF16')
     parsed_args = parser.parse_args(args=args)
 
-    # determine target dtype from the output filename
-    output_path = parsed_args.output
-    cast_to = np.float16
-    if "fp16" in output_path:
-        cast_to = np.float16
-    elif "bf16" in output_path:
-        cast_to = ml_dtypes.bfloat16
+    # determine target dtype
+    target_dtype = parsed_args.dtype
+    message(f"Target data type: {target_dtype}")
 
-    # build path to the output safetensors file (and the temporary file)
-    output_path = Path(parsed_args.output)
-    if output_path.suffix != ".safetensors":
+    # build path to the output safetensors file
+    output_path  = Path(parsed_args.output)
+    if not output_path.suffix:
         output_path = output_path.with_suffix(".safetensors")
+    new_filename = f"{output_path.stem}_{target_dtype.lower()}{output_path.suffix}"
+    output_path  = output_path.with_name(new_filename)
 
-    if parsed_args.low_ram: temp_context = tempfile.TemporaryFile(dir=output_path.parent)
-    else:                   temp_context = io.BytesIO()
+    # prepare the temporary file for in-memory or disk based on --low-ram argument
+    if parsed_args.low_ram:
+        message("Using disk-based temporary file for low RAM mode.")
+        tmp_context = tempfile.TemporaryFile(dir=output_path.parent)
+    else:
+        message("Using in-memory buffer for temporary data.")
+        tmp_context = io.BytesIO()
 
-
-    with temp_context as temp_file:
+    with tmp_context as tmp_rawtensor_file:
 
         progress_bar = ProgressBar()
-        safetensor_header = write_binary_tensor_file(
-                                    temp_file,
+        safetensor_header = write_rawtensor_file(
+                                    tmp_rawtensor_file,
                                     parsed_args.input_files,
-                                    cast_to="BF16",
-                                    transform=TensorMapper(),
-                                    progress=progress_bar)
-
-        temp_file.seek(0)
-        build_safetensors(output_path, temp_file,
-                        header    = safetensor_header,
-                        alignment = 64,
-                        )
-
-
+                                    cast_to       = target_dtype,
+                                    tensor_mapper = TensorMapper(),
+                                    progress      = progress_bar)
+        tmp_rawtensor_file.seek(0)
+        progress_bar = ProgressBar()
+        build_safetensors(output_path,
+                          input_rawtensor_file = tmp_rawtensor_file,
+                          header               = safetensor_header,
+                          alignment            = 64,
+                          progress             = progress_bar
+                          )
 
 
 if __name__ == "__main__":
