@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# File    : convmodel.sh
-# Purpose : Wrapper for `convmodel.py` that handles the python virtual environment
+# File    : z2comfy.sh
+# Purpose : Wrapper for `z2comfy.py` that handles the python virtual environment
 # Author  : Martin Rizzo | <martinrizzo@gmail.com>
 # Date    : Jun 26, 2026
 # Repo    : https://github.com/martin-rizzo/ComfyUI-ZImagePowerNodes
 # License : MIT
 #- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-#                          ComfyUI-ZImagePowerNodes
-#     ComfyUI nodes designed to power the "Z-Image/Z-Image Turbo" models.
+#                               ZImageCkptTools
+#          CLI tools for manipulating and verifying Z-Image checkpoints.
 #_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 RESOLVE_LINK=true                #< `true` to resolve symbolic links to this script
 DEDICATED_VENV=false             #< `true` if the script requires a unique virtual env separate from other project scripts

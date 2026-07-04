@@ -1,13 +1,13 @@
 """
-File    : convmodel.py
+File    : z2comfy.py
 Purpose : Script to convert the original Z-Image checkpoint to a format compatible with ComfyUI
 Author  : Martin Rizzo | <martinrizzo@gmail.com>
 Date    : Jun 26, 2026
 Repo    : https://github.com/martin-rizzo/ComfyUI-ZImagePowerNodes
 License : MIT
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-                          ComfyUI-ZImagePowerNodes
-     ComfyUI nodes designed to power the "Z-Image/Z-Image Turbo" models.
+                               ZImageCkptTools
+          CLI tools for manipulating and verifying Z-Image checkpoints.
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 """
 import io
