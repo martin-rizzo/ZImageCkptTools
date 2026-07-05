@@ -17,7 +17,7 @@ import json
 import tempfile
 import argparse
 from pathlib import Path
-from typing import IO
+from typing import IO, cast
 if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv):
     # modules that are not available in the standard library are imported here
     import numpy as np
@@ -54,7 +54,7 @@ def message(msg: str, *extra_messages: str, padding: int = 0, file=sys.stderr) -
     """Displays a regular message with custom padding."""
     pad_spaces = " " * padding
     if msg:
-        print(f"{pad_spaces}{GREEN}>{RESET} {msg}", end="", file=file)
+        print(f"{pad_spaces} {GREEN}>{RESET} {msg}", end="", file=file)
         for extra in extra_messages:
             print(f" {extra}", end="", file=file)
     print(file=file)
@@ -63,17 +63,17 @@ def message(msg: str, *extra_messages: str, padding: int = 0, file=sys.stderr) -
 def warning(msg: str, *info_messages: str, padding: int = 0, file=sys.stderr) -> None:
     """Displays a warning message and its info messages with custom padding."""
     pad_spaces = " " * padding
-    print(f"{pad_spaces}{CYAN}[{YELLOW}WARNING{CYAN}]{YELLOW} {msg}{RESET}", file=file)
+    print(f"{pad_spaces} {CYAN}[{YELLOW}WARNING{CYAN}]{YELLOW} {msg}{RESET}", file=file)
     for info_message in info_messages:
-        print(f"{pad_spaces} {CYAN}\xF0\x9F\x9B\x88 {info_message}{RESET}", file=file)
+        print(f"{pad_spaces}   {CYAN}\xF0\x9F\x9B\x88 {info_message}{RESET}", file=file)
 
 
 def error(msg: str, *info_messages: str, padding: int = 0, file=sys.stderr) -> None:
     """Displays an error message and its info messages with custom padding."""
     pad_spaces = " " * padding
-    print(f"{pad_spaces}{CYAN}[{RED}ERROR{CYAN}]{RED} {msg}{RESET}", file=file)
+    print(f"{pad_spaces} {CYAN}[{RED}ERROR{CYAN}]{RED} {msg}{RESET}", file=file)
     for info_message in info_messages:
-        print(f"{pad_spaces} {CYAN}\xF0\x9F\x9B\x88 {info_message}{RESET}", file=file)
+        print(f"{pad_spaces}   {CYAN}\xF0\x9F\x9B\x88 {info_message}{RESET}", file=file)
 
 
 #============================== PROGRESS BAR ===============================#
@@ -182,6 +182,33 @@ class TensorMapper:
 
 #============================= PROCESS TENSORS =============================#
 
+def softplus_clamp(tensor, clamp_limit, *, sharpness=1.2):
+    """
+    Applies a smooth pseudo-clamping operation to a tensor using softplus functions.
+
+    The result is a smooth, fully differentiable approximation of a hard clip.
+    It behaves approximately like the identity function in the center of the range,
+    but compresses values across boundaries to asymptotically approach the +-clamp_limit.
+
+    Args:
+        tensor      : Input tensor to be clamped.
+        clamp_limit : Maximum absolute value allowed. Values beyond this limit
+                      are smoothly clamped to the boundary values.
+        sharpness   : Controls how quickly the function flattens near the
+                      clamping boundaries. Higher values create sharper transitions.
+                      Default is 1.2.
+    Returns:
+        Tensor of the same shape as input, with smooth clamping applied.
+    """
+    # softplus(x) = ln(1 + exp(x))
+    def softplus(x):
+        return np.log1p(np.exp(np.clip(x, -20, 20)))
+
+    # symmetric combination to bound both negative and positive sides
+    tp = tensor + clamp_limit
+    tm = tensor - clamp_limit
+    return tensor - (softplus(sharpness * tm) - softplus(-sharpness * tp)) / sharpness
+
 
 def build_safetensors(output_safetensors_path: Path | str,
                       input_rawtensor_file   : IO[bytes],
@@ -238,9 +265,11 @@ def build_safetensors(output_safetensors_path: Path | str,
 def write_rawtensor_file(output_rawtensor_file: IO[bytes],
                          input_file_paths     : list[Path | str],
                          *,
-                         cast_to      : str,
-                         tensor_mapper: Callable    | None = None,
-                         progress     : ProgressBar | None = None
+                         cast_to        : str,
+                         tensor_mapper  : Callable    | None = None,
+                         clamp_limit    : float       | None = None,
+                         clamp_sharpness: float       | None = None,
+                         progress       : ProgressBar | None = None
                          ) -> SafetensorsHeader:
     """
     Process tensors, cast them, and prepare binary data and header metadata for
@@ -285,7 +314,7 @@ def write_rawtensor_file(output_rawtensor_file: IO[bytes],
             total = len(keys)
 
             for i, tensor_name in enumerate(keys):
-                tensor : np.ndarray | None = f_in.get_tensor(tensor_name)
+                tensor = cast(np.ndarray, f_in.get_tensor(tensor_name))
                 if tensor is None:
                     continue
 
@@ -294,6 +323,18 @@ def write_rawtensor_file(output_rawtensor_file: IO[bytes],
                     tensor_name, tensor = tensor_mapper(tensor_name, tensor)
                 if not tensor_name or tensor is None:
                     continue
+
+                # clamp tensor if required by the user
+                if clamp_limit is not None:
+                    tensor = softplus_clamp(tensor,
+                                            clamp_limit = clamp_limit,
+                                            sharpness   = clamp_sharpness if clamp_sharpness is not None else 1.2)
+
+                ## store min and max values of the data
+                #min, max = tensor.min(), tensor.max()
+                #if min<global_min: global_min = min
+                #if max>global_max: global_max = max
+
 
                 # convert tensor to raw bytes
                 tensor       = tensor.astype(np.dtype(dtype))
@@ -319,6 +360,59 @@ def write_rawtensor_file(output_rawtensor_file: IO[bytes],
     return header
 
 
+def parse_clamp_args(clamp_str        : str,
+                     default_sharpness: float = 0.8
+                     ) -> tuple[float, float] | tuple[None, None]:
+    """
+    Parse a clamp argument string in the format "limit" or "limit:sharpness" 
+    into a tuple of floats.
+
+    Args:
+        clamp_str        : String in format "limit" or "limit:sharpness".
+        default_sharpness: The value to use if no sharpness is provided in the string.
+
+    Returns:
+        Tuple of (limit, sharpness) as floats, or (None, None) if parsing fails.
+    """
+    try:
+        if ':' in clamp_str:
+            limit_str, _, sharpness_str = clamp_str.partition(':')
+            limit     = float(limit_str)
+            sharpness = float(sharpness_str) if sharpness_str else default_sharpness
+        else:
+            limit     = float(clamp_str)
+            sharpness = default_sharpness
+        return limit, sharpness
+
+    except ValueError:
+        return None, None
+
+
+
+def make_clamping_tag(limit: float | None, sharpness: float | None) -> str:
+    """
+    Constructs a tag string for clamping parameters to be appended to output filenames.
+
+    Args:
+        limit     : The maximum value for clamping.
+        sharpness : The sharpness factor of the clamping curve.
+
+    Returns:
+        A formatted string tag in the format '_clamp<LIMIT>s<SHARPNESS>'
+        or '_clamp<LIMIT>' if sharpness is None. Numeric values are formatted
+        by removing the decimal point and keeping one decimal place (3.14 -> 31, 7 -> 70).
+    """
+    def format_value(value: float) -> str:
+        return f"{int(round(value * 10)):02d}"
+
+    if limit is None:
+        return ""
+    elif sharpness is None:
+        return f"_clamp{format_value(limit)}"
+    else:
+        return f"_clamp{format_value(limit)}sharp{format_value(sharpness)}"
+
+
 #===========================================================================#
 #////////////////////////////////// MAIN ///////////////////////////////////#
 #===========================================================================#
@@ -341,26 +435,47 @@ def main(args=None, parent_script=None):
     )
 
     parser.add_argument('input_files', nargs='+', metavar='INPUT', help="One or more input safetensors files to process.")
-    parser.add_argument('-o', '--output', default='z_image_turbo.safetensors', help="Output safetensors file path.")
+    parser.add_argument('-o', '--output' , default='z_image_turbo.safetensors', help="Output safetensors file path.")
     parser.add_argument('-l', '--low-ram', action="store_true", help="Write temporary data to disk instead of RAM, useful for low-memory environments.")
+    parser.add_argument('-c', '--clamp'  , type=str, metavar='LIMIT[:SHARPNESS]',
+                        help=("Apply value clipping to weights. Specify as 'limit' or 'limit:sharpness'.\n"
+                              "Example: '7.0:0.8' to set limit 7.0 with a sharpness factor of 0.8."))
     # mutually exclusive group for precision arguments
     precision_group = parser.add_mutually_exclusive_group()
     precision_group.add_argument('--bf16', action='store_const', const='BF16', dest='dtype', help="Set output precision to BF16 (default).")
     precision_group.add_argument('--fp16', action='store_const', const='FP16', dest='dtype', help="Set output precision to F16.")
     precision_group.add_argument('--fp32', action='store_const', const='FP32', dest='dtype', help="Set output precision to F32.")
     parser.set_defaults(dtype='BF16')
+
+
     parsed_args = parser.parse_args(args=args)
 
     # determine target dtype
     target_dtype = parsed_args.dtype
-    message(f"Target data type: {target_dtype}")
+
+    # determine the clamp parameters (if any)
+    clamp_limit, clamp_sharpness = None, None
+    if parsed_args.clamp:
+        clamp_limit, clamp_sharpness = parse_clamp_args(parsed_args.clamp)
+        if clamp_limit is None or clamp_sharpness is None:
+            error("Invalid --clamp argument format. Expected format: 'limit:sharpness'")
+            sys.exit(1)
+    clamping_tag = make_clamping_tag(clamp_limit, clamp_sharpness)
 
     # build path to the output safetensors file
     output_path  = Path(parsed_args.output)
     if not output_path.suffix:
         output_path = output_path.with_suffix(".safetensors")
-    new_filename = f"{output_path.stem}_{target_dtype.lower()}{output_path.suffix}"
-    output_path  = output_path.with_name(new_filename)
+
+    new_filename = f"{output_path.stem}_{target_dtype.lower()}{clamping_tag}{output_path.suffix}"
+    output_path = output_path.with_name(new_filename)
+
+
+    # print configuration details
+    clamp_limit_str = f"{clamp_limit} (sharpness {clamp_sharpness})" if clamp_limit is not None else "none"
+    message(f"Target Data Type : {target_dtype}")
+    message(f"Clamping Value   : {clamp_limit_str}")
+    message(f"Output File      : {output_path.name}")
 
     # prepare the temporary file for in-memory or disk based on --low-ram argument
     if parsed_args.low_ram:
@@ -376,9 +491,11 @@ def main(args=None, parent_script=None):
         safetensor_header = write_rawtensor_file(
                                     tmp_rawtensor_file,
                                     parsed_args.input_files,
-                                    cast_to       = target_dtype,
-                                    tensor_mapper = TensorMapper(),
-                                    progress      = progress_bar)
+                                    cast_to         = target_dtype,
+                                    clamp_limit     = clamp_limit,
+                                    clamp_sharpness = clamp_sharpness,
+                                    tensor_mapper   = TensorMapper(),
+                                    progress        = progress_bar)
         tmp_rawtensor_file.seek(0)
         progress_bar = ProgressBar()
         build_safetensors(output_path,
