@@ -262,6 +262,49 @@ def build_safetensors(output_safetensors_path: Path | str,
                 progress.update(written_size / total_size)
 
 
+def cast_tensor(tensor: np.ndarray, *, dtype: str) -> np.ndarray:
+    """
+    Cast a tensor to a specified floating-point representation.
+    Args:
+        tensor : The input numpy array to be cast.
+        dtype  : The target data type as a string (e.g., "FP32", "FP16", "BF16", "FP16E", "BF16E").
+                 "FP16E" and "BF16E" apply stochastic rounding.
+    Returns:
+        A new numpy array cast to the requested dtype.
+    """
+    dtype = dtype.upper()
+    if dtype == "FP32":
+        return tensor.astype(np.float32)
+
+    elif dtype == "FP16":
+        return tensor.astype(np.float16)
+
+    elif dtype == "BF16":
+        return tensor.astype(np.dtype(ml_dtypes.bfloat16))
+
+    elif dtype == "FP16E": # FP16 with exact stochastic rounding
+        tensor = tensor.astype(np.float32, order='C', copy=True)
+        tensor_fp16_down = np.nextafter(tensor, -np.inf).astype(np.float16).astype(np.float32)
+        tensor_fp16_up   = np.nextafter(tensor_fp16_down, np.inf).astype(np.float16).astype(np.float32)
+        eps = tensor_fp16_up - tensor_fp16_down
+        fraction = np.divide(
+            tensor - tensor_fp16_down, eps,
+            out=np.zeros_like(tensor), where=eps != 0
+        )
+        noise = np.random.uniform(0.0, 1.0, size=tensor.shape).astype(np.float32)
+        rounded_fp32 = np.where(fraction > noise, tensor_fp16_up, tensor_fp16_down)
+        return rounded_fp32.astype(np.float16)
+
+    elif dtype == "BF16E": # BF16 with binary stochastic rounding
+        tensor = tensor.astype(np.float32, order='C', copy=True)
+        noise_int       = np.random.randint(0, 65536, size=tensor.shape, dtype=np.uint32)
+        stochastic_bits = (tensor.view(np.uint32) + noise_int) & 0xFFFF0000
+        stochastic_fp32 = stochastic_bits.view(np.float32)
+        return stochastic_fp32.astype(np.dtype(ml_dtypes.bfloat16))
+    else:
+        raise ValueError(f"Unknown dtype: {dtype}")
+
+
 def write_rawtensor_file(output_rawtensor_file: IO[bytes],
                          input_file_paths     : list[Path | str],
                          *,
@@ -292,9 +335,11 @@ def write_rawtensor_file(output_rawtensor_file: IO[bytes],
         dtype, shape, and byte offsets.
     """
     cast_to = cast_to.upper()
-    if   cast_to in ("F32","FP32","FLOAT32"): st_dtype, dtype = "F32" , np.float32
-    elif cast_to in ("F16","FP16","FLOAT16"): st_dtype, dtype = "F16" , np.float16
-    elif cast_to in ("BF16")                : st_dtype, dtype = "BF16", ml_dtypes.bfloat16
+    if   cast_to in ("F32" ,"FP32" ,"FLOAT32" ): st_dtype, dtype = "F32" , "FP32"
+    elif cast_to in ("F16" ,"FP16" ,"FLOAT16" ): st_dtype, dtype = "F16" , "FP16"
+    elif cast_to in ("F16E","FP16E","FLOAT16E"): st_dtype, dtype = "F16" , "FP16E"
+    elif cast_to in ("BF16" ,"BFLOAT16" )      : st_dtype, dtype = "BF16", "BF16"
+    elif cast_to in ("BF16E","BFLOAT16E")      : st_dtype, dtype = "BF16", "BF16E"
     else:
         raise ValueError(f"Invalid cast_to value: {cast_to}")
 
@@ -337,7 +382,7 @@ def write_rawtensor_file(output_rawtensor_file: IO[bytes],
 
 
                 # convert tensor to raw bytes
-                tensor       = tensor.astype(np.dtype(dtype))
+                tensor       = cast_tensor(tensor, dtype=dtype)
                 tensor_bytes = tensor.tobytes()
                 st_start     = current_offset
                 st_end       = st_start + len(tensor_bytes)
@@ -442,9 +487,11 @@ def main(args=None, parent_script=None):
                               "Example: '7.0:0.8' to set limit 7.0 with a sharpness factor of 0.8."))
     # mutually exclusive group for precision arguments
     precision_group = parser.add_mutually_exclusive_group()
-    precision_group.add_argument('--bf16', action='store_const', const='BF16', dest='dtype', help="Set output precision to BF16 (default).")
-    precision_group.add_argument('--fp16', action='store_const', const='FP16', dest='dtype', help="Set output precision to F16.")
-    precision_group.add_argument('--fp32', action='store_const', const='FP32', dest='dtype', help="Set output precision to F32.")
+    precision_group.add_argument('--fp32' , action='store_const', const='FP32' , dest='dtype', help="Set output precision to F32.")
+    precision_group.add_argument('--fp16' , action='store_const', const='FP16' , dest='dtype', help="Set output precision to F16.")
+    precision_group.add_argument('--bf16' , action='store_const', const='BF16' , dest='dtype', help="Set output precision to BF16 (default).")
+    precision_group.add_argument('--fp16e', action='store_const', const='FP16E', dest='dtype', help="Set output precision to FP16 with stochastic rounding.")
+    precision_group.add_argument('--bf16e', action='store_const', const='BF16E', dest='dtype', help="Set output precision to BF16 with stochastic rounding.")
     parser.set_defaults(dtype='BF16')
 
 
