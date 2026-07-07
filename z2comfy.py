@@ -306,7 +306,7 @@ def cast_tensor(tensor: np.ndarray, *, dtype: str) -> np.ndarray:
 
 
 def write_rawtensor_file(output_rawtensor_file: IO[bytes],
-                         input_file_paths     : list[Path | str],
+                         input_file_paths     : list[Path],
                          *,
                          cast_to        : str,
                          tensor_mapper  : Callable    | None = None,
@@ -462,6 +462,54 @@ def make_clamping_tag(limit: float | None, sharpness: float | None) -> str:
 #////////////////////////////////// MAIN ///////////////////////////////////#
 #===========================================================================#
 
+def validate_and_collect_safetensors(input_files: list[str | Path]) -> tuple[list[Path], str]:
+    """
+    Validate input paths and collect safetensors files from a directory or list.
+
+    Args:
+        input_files: A list of paths provided by the user via command line,
+                     pointing to files or a single directory.
+    Returns:
+        A tuple containing a list of validated Path objects to safetensors
+        files and the detected model type as a string.
+    """
+    paths      : list[Path] = [Path(f) for f in input_files]
+    valid_files: list[Path] = []
+    directory: Path | None = None
+
+    # check if any file is actually a directory
+    for file_or_dir in paths:
+        if file_or_dir.is_dir():
+            if directory is None:
+                directory = file_or_dir
+            else: raise ValueError("Multiple directories provided. Only one directory is allowed.")
+
+    # if directory is present, ensure it is the only element
+    if directory and len(paths) > 1:
+        raise ValueError("Cannot specify a directory and individual files simultaneously.")
+
+    # search for "model*.safetensors" and "diffusion*.safetensors"
+    # inside directory and inside directory/transformer
+    if directory:
+        search_paths = [directory, directory / "transformer"]
+        patterns     = ["model*.safetensors", "diffusion*.safetensors"]
+        for base_path in search_paths:
+            if not base_path.exists():
+                continue
+            for pattern in patterns:
+                valid_files.extend(base_path.glob(pattern))
+        valid_files.sort()
+
+    # if not a directory, treat all as individual files
+    if not directory:
+        valid_files = paths
+
+    if not valid_files:
+        raise ValueError(f"No valid .safetensors files.")
+
+    return valid_files, "z-image"
+
+
 def main(args=None, parent_script=None):
     """
     Main entry point for the script.
@@ -517,11 +565,17 @@ def main(args=None, parent_script=None):
     new_filename = f"{output_path.stem}_{target_dtype.lower()}{clamping_tag}{output_path.suffix}"
     output_path = output_path.with_name(new_filename)
 
+    # check input files
+    input_files, model = validate_and_collect_safetensors(parsed_args.input_files)
+    input_file_count = len(input_files)
+
 
     # print configuration details
     clamp_limit_str = f"{clamp_limit} (sharpness {clamp_sharpness})" if clamp_limit is not None else "none"
-    message(f"Target Data Type : {target_dtype}")
+    message(f"Model            : {model.upper()}")
+    message(f"Target Data Type : {target_dtype.upper()}")
     message(f"Clamping Value   : {clamp_limit_str}")
+    message(f"Input            : {input_file_count} safetenstensors {"file" if input_file_count == 1 else "files"}")
     message(f"Output File      : {output_path.name}")
 
     # prepare the temporary file for in-memory or disk based on --low-ram argument
@@ -532,25 +586,35 @@ def main(args=None, parent_script=None):
         message("Using in-memory buffer for temporary data.")
         tmp_context = io.BytesIO()
 
-    with tmp_context as tmp_rawtensor_file:
 
-        progress_bar = ProgressBar()
-        safetensor_header = write_rawtensor_file(
-                                    tmp_rawtensor_file,
-                                    parsed_args.input_files,
-                                    cast_to         = target_dtype,
-                                    clamp_limit     = clamp_limit,
-                                    clamp_sharpness = clamp_sharpness,
-                                    tensor_mapper   = TensorMapper(),
-                                    progress        = progress_bar)
-        tmp_rawtensor_file.seek(0)
-        progress_bar = ProgressBar()
-        build_safetensors(output_path,
-                          input_rawtensor_file = tmp_rawtensor_file,
-                          header               = safetensor_header,
-                          alignment            = 64,
-                          progress             = progress_bar
-                          )
+    if model == "z-image":
+        with tmp_context as tmp_rawtensor_file:
+
+            progress_bar = ProgressBar()
+            safetensor_header = write_rawtensor_file(
+                                        tmp_rawtensor_file,
+                                        input_files,
+                                        cast_to         = target_dtype,
+                                        clamp_limit     = clamp_limit,
+                                        clamp_sharpness = clamp_sharpness,
+                                        tensor_mapper   = TensorMapper(),
+                                        progress        = progress_bar)
+            tmp_rawtensor_file.seek(0)
+            progress_bar = ProgressBar()
+            build_safetensors(output_path,
+                            input_rawtensor_file = tmp_rawtensor_file,
+                            header               = safetensor_header,
+                            alignment            = 64,
+                            progress             = progress_bar
+                            )
+
+    elif model == "qwen3-4b":
+        error("qwen3-4b is not supported yet")
+        exit(1)
+
+    else:
+        error("Unknown model")
+        exit(1)
 
 
 if __name__ == "__main__":
