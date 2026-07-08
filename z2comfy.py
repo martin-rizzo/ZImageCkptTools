@@ -27,6 +27,29 @@ if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv
     from typing      import Callable, Any
     from safetensors import safe_open
 
+    # Constant to avoid division by zero in Float32 operations.
+    # Equivalent to the smallest representable normalized positive number.
+    FP32_EPSILON = np.finfo(np.float32).tiny
+
+    SAFETENSORS_DTYPES = {
+        np.dtype(np.float32): "F32" ,
+        np.dtype(np.float16): "F16" ,
+        np.dtype(np.float64): "F64" ,
+        np.dtype(np.uint8  ): "U8"  ,
+        np.dtype(np.int8   ): "I8"  ,
+        np.dtype(np.uint16 ): "U16" ,
+        np.dtype(np.int16  ): "I16" ,
+        np.dtype(np.int32  ): "I32" ,
+        np.dtype(np.int64  ): "I64" ,
+        np.dtype(np.bool_  ): "BOOL",
+        np.dtype(np.uint32 ): "U32" ,
+        np.dtype(np.uint64 ): "U64" ,
+        np.dtype(ml_dtypes.bfloat16     ): "BF16"   ,
+        np.dtype(ml_dtypes.float8_e4m3fn): "F8_E4M3",
+        np.dtype(ml_dtypes.float8_e5m2  ): "F8_E5M2",
+    }
+
+
 # Safetensors Header Structure
 # each tensor name maps to a dictionary containing its metadata
 type SafetensorsHeader = dict[str, dict[str, Any]]
@@ -37,29 +60,6 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # ConvRot configuration
 # Must be a power of 4 for Regular Hadamard (e.g. 16, 64, 256)
 CONVROT_GROUP_SIZE = 256
-
-# Constant to avoid division by zero in Float32 operations.
-# Equivalent to the smallest representable normalized positive number.
-FP32_EPSILON = np.finfo(np.float32).tiny
-
-SAFETENSORS_DTYPES = {
-    np.dtype(np.float32): "F32" ,
-    np.dtype(np.float16): "F16" ,
-    np.dtype(np.float64): "F64" ,
-    np.dtype(np.uint8  ): "U8"  ,
-    np.dtype(np.int8   ): "I8"  ,
-    np.dtype(np.uint16 ): "U16" ,
-    np.dtype(np.int16  ): "I16" ,
-    np.dtype(np.int32  ): "I32" ,
-    np.dtype(np.int64  ): "I64" ,
-    np.dtype(np.bool_  ): "BOOL",
-    np.dtype(np.uint32 ): "U32" ,
-    np.dtype(np.uint64 ): "U64" ,
-    np.dtype(ml_dtypes.bfloat16     ): "BF16"   ,
-    np.dtype(ml_dtypes.float8_e4m3fn): "F8_E4M3",
-    np.dtype(ml_dtypes.float8_e5m2  ): "F8_E5M2",
-}
-
 
 # ANSI escape codes for colored terminal output
 RED      = '\033[91m'
@@ -219,10 +219,12 @@ class TensorMapper:
 #============================= PROCESS TENSORS =============================#
 
 @lru_cache(maxsize=8)
-def build_hadamard(size: int, dtype: npt.DTypeLike = np.float32) -> np.ndarray:
+def build_hadamard(size: int, dtype: npt.DTypeLike | None = None) -> np.ndarray:
     """Build a normalized REGULAR orthogonal Hadamard matrix using NumPy."""
     if size < 4 or (size & (size - 1)) != 0 or (size.bit_length() - 1) % 2 != 0:
         raise ValueError(f"Regular Hadamard size must be a power of 4, got {size}")
+    if dtype is None:
+        dtype = np.float32
 
     # base H4 from Theorem 3.3 (Eq 9 in the paper)
     # notice how every row and column sums to exactly 2
@@ -751,22 +753,24 @@ def main(args=None, parent_script=None):
         prog = parent_script + " " + os.path.basename(__file__).split('.')
 
     parser = argparse.ArgumentParser(
-        prog            = prog,
-        description     = "Convert and merge original diffusion model weights to ComfyUI format.",
+        prog        = prog,
+        description = (
+            "Convert Z-Image checkpoint files into various formats compatible with ComfyUI.\n\n"
+            "This utility supports multiple precision formats (FP32, FP16, BF16), integer "
+            "quantization (I8CONVROT), and stochastic rounding techniques. "
+            "While originally designed for the official Z-Image files "
+            "(e.g., https://huggingface.co/Tongyi-MAI/Z-Image-Turbo), "
+            "this tool should be compatible with any checkpoint within this model family."
+        ),
         formatter_class = argparse.RawTextHelpFormatter,
     )
 
     parser.add_argument('input_files', nargs='+', metavar='INPUT', help="One or more input safetensors files to process.")
     parser.add_argument('-o', '--output' , default='z_image_turbo.safetensors', help="Output safetensors file path.")
     parser.add_argument('-l', '--low-ram', action="store_true", help="Write temporary data to disk instead of RAM, useful for low-memory environments.")
-    parser.add_argument('-c', '--clamp'  , type=str, metavar='LIMIT[:SHARPNESS]',
-                        help=("Apply value clipping to weights. Specify as 'limit' or 'limit:sharpness'.\n"
-                              "Example: '7.0:0.8' to set limit 7.0 with a sharpness factor of 0.8."))
-    parser.add_argument('-s', '--seed', type=int, default=100, metavar='N',
-                        help=("This value is used with types involving stochastic rounding, such as --fp16e or --bf16e.\n"
-                              "Setting a fixed seed ensures reproducible results. Default: 100."))
-    # mutually exclusive group for precision arguments
-    precision_group = parser.add_mutually_exclusive_group()
+
+    precision_main_group = parser.add_argument_group('precision & quantization options')
+    precision_group = precision_main_group.add_mutually_exclusive_group()
     precision_group.add_argument('--fp32'     , action='store_const', const='FP32'     , dest='dtype', help="Set output precision to F32.")
     precision_group.add_argument('--fp16'     , action='store_const', const='FP16'     , dest='dtype', help="Set output precision to F16.")
     precision_group.add_argument('--bf16'     , action='store_const', const='BF16'     , dest='dtype', help="Set output precision to BF16 (default).")
@@ -775,7 +779,13 @@ def main(args=None, parent_script=None):
     precision_group.add_argument('--i8convrot', action='store_const', const='I8CONVROT', dest='dtype', help="Set output precision to I8CONVROT.")
     parser.set_defaults(dtype='BF16')
 
-
+    advanced_group = parser.add_argument_group('advanced options')
+    advanced_group.add_argument('-c', '--clamp'  , type=str, metavar='LIMIT[:SHARPNESS]',
+                                help=("Apply value clipping to weights. Specify as 'limit' or 'limit:sharpness'.\n"
+                                      "Example: '7.0:0.8' to set limit 7.0 with a sharpness factor of 0.8."))
+    advanced_group.add_argument('-s', '--seed', type=int, default=100, metavar='N',
+                                help=("This value is used with types involving stochastic rounding, such as --fp16e or --bf16e.\n"
+                                      "Setting a fixed seed ensures reproducible results. Default: 100."))
     parsed_args = parser.parse_args(args=args)
 
     # determine target dtype
