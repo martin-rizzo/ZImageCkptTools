@@ -13,12 +13,13 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 import io
 import os
 import sys
+import copy
 import json
 import tempfile
 import argparse
 from functools import lru_cache
 from pathlib import Path
-from typing import IO, cast
+from typing import Final, IO, cast
 if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv):
     # modules that are not available in the standard library are imported here
     import numpy as np
@@ -29,9 +30,11 @@ if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv
 
     # Constant to avoid division by zero in Float32 operations.
     # Equivalent to the smallest representable normalized positive number.
-    FP32_EPSILON = np.finfo(np.float32).tiny
+    FP32_EPSILON: Final = np.finfo(np.float32).tiny
 
-    SAFETENSORS_DTYPES = {
+    # Mapping from numpy data types to their corresponding type identifier
+    # used in the safetensors file format
+    SAFETENSORS_DTYPES: Final = {
         np.dtype(np.float32): "F32" ,
         np.dtype(np.float16): "F16" ,
         np.dtype(np.float64): "F64" ,
@@ -48,6 +51,15 @@ if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv
         np.dtype(ml_dtypes.float8_e4m3fn): "F8_E4M3",
         np.dtype(ml_dtypes.float8_e5m2  ): "F8_E5M2",
     }
+
+    # Defines the size in bytes for each supported safetensors data type identifier
+    SAFETENSORS_DTYPE_SIZES: Final = {
+        "F64": 8, "I64": 8, "U64": 8,
+        "F32": 4, "I32": 4, "U32": 4,
+        "F16": 2, "BF16": 2, "I16": 2, "U16": 2,
+        "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "BOOL": 1
+    }
+
 
 
 # Safetensors Header Structure
@@ -102,6 +114,88 @@ def error(msg: str, *info_messages: str, padding: int = 0, file=sys.stderr) -> N
     print(f"{pad_spaces} {CYAN}[{RED}ERROR{CYAN}]{RED} {msg}{RESET}", file=file)
     for info_message in info_messages:
         print(f"{pad_spaces}   {CYAN}\xF0\x9F\x9B\x88 {info_message}{RESET}", file=file)
+
+
+
+#================================= HELPERS =================================#
+
+def copy_raw_data(f_out   : IO[bytes],
+                  f_source: IO[bytes],
+                  *,
+                  source_offset: int,
+                  byte_count   : int,
+                  chunk_size   : int | None = None) -> None:
+    """
+    Copy a specific number of bytes from a source file to a destination file.
+
+    Args:
+        f_out        : The destination file object.
+        f_source     : The source file object.
+        source_offset: The starting position in the source file to begin copying from.
+        byte_count   : The total number of bytes to copy.
+        chunk_size (optional): The size of each read/write chunk. If None, copies all bytes in one operation.
+    """
+    f_source.seek(source_offset)
+
+    # copy all bytes in one go
+    if chunk_size is None:
+        chunk = f_source.read(byte_count)
+        if len(chunk) < byte_count: raise EOFError("Unexpected end of file while reading data from temporary file.")
+        f_out.write(chunk)
+        return
+
+    # copy in blocks (buffered)
+    bytes_left = byte_count
+    while bytes_left > 0:
+        to_read = min(chunk_size, bytes_left)
+        chunk   = f_source.read( to_read )
+        if len(chunk) < to_read: raise EOFError("Unexpected end of file while reading a block of data from temporary file.")
+        f_out.write(chunk)
+        bytes_left -= len(chunk)
+
+
+def sort_safetensors_header(safetensor_header: dict) -> dict:
+    """
+    Sorts the header of a safetensors file and recalculates data offsets.
+
+    This function reorganizes tensors within a safetensors header to
+    optimize alignment by placing larger data types first.
+    """
+    # create a deep copy to avoid mutating the original header object
+    src_header = copy.deepcopy(safetensor_header)
+    new_header = {}
+
+    # preserve global metadata if it exists in the source header
+    if "__metadata__" in src_header:
+        new_header["__metadata__"] = src_header.pop("__metadata__")
+
+    def get_order(tensor_name: str, tensor_info: dict[str, Any]):
+        """Helper to determine the sorting priority of a tensor."""
+        dtype = tensor_info.get("dtype", "F32")
+        # - primary sort  : dtype size (descending)
+        # - secondary sort: dtype name (ascending)
+        # - tertiary sort : tensor name (ascending)
+        return (-SAFETENSORS_DTYPE_SIZES.get(dtype, 4), dtype, tensor_name)
+
+    # sort the items based on the defined order criteria
+    sorted_tensors = sorted(src_header.items(),
+                            key = lambda item: get_order(item[0], item[1]))
+
+    # reconstruct the header and recalculate offsets sequentially starting from 0
+    current_offset = 0
+    for tensor_name, tensor_info in sorted_tensors:
+        old_offsets = tensor_info["data_offsets"]
+        tensor_size_bytes = old_offsets[1] - old_offsets[0]
+        start = current_offset
+        end   = start + tensor_size_bytes
+        new_header[tensor_name] = {
+            "dtype"       : tensor_info["dtype"],
+            "shape"       : tensor_info["shape"],
+            "data_offsets": [start, end]
+        }
+        current_offset = end
+
+    return new_header
 
 
 #============================== PROGRESS BAR ===============================#
@@ -404,55 +498,78 @@ def softplus_clamp(tensor, clamp_limit, *, sharpness=1.2):
 
 
 def build_safetensors(output_safetensors_path: Path | str,
-                      input_rawtensor_file   : IO[bytes],
                       *,
-                      header   : SafetensorsHeader,
+                      output_header        : SafetensorsHeader,
+                      sour_rawtensor_header: SafetensorsHeader,
+                      sour_rawtensor_file  : IO[bytes],
                       alignment: int = 64,
                       progress : ProgressBar | None = None
                       ):
     """
     Combines the metadata header and the raw binary tensor data into a valid
-    single .safetensors file.
+    single .safetensors file by reordering tensors according to output_header.
 
     Args:
-        output_safetensors_path : Path where the final .safetensors file will be saved.
-        input_rawtensor_file    : An open file-like object (in rb or w+b mode) containing
-                                  raw tensor data generated with `write_rawtensor_file(..)`.
-        header                  : Dictionary containing the metadata of each tensors.
-        alignment               : Byte alignment required for the start of the data buffer.
-        progress                : An optional progress bar object to track the
-                                  writing progress.
+        output_safetensors_path: Path where the final .safetensors file will be saved.
+        output_header          : The final ordered header with its own calculated offsets.
+        sour_rawtensor_header  : The original header mapping to the temporary raw file.
+        sour_rawtensor_file    : Open IO stream of the temporary raw tensor file.
+        alignment              : Byte alignment required for the start of the tensor raw data.
+        progress               : An optional progress bar object to track the writing progress.
     """
     HEADER_START_OFFSET = 8
-    COPY_CHUNK_SIZE = 1024 * 1024
+    CHUNK_SIZE = 128 * (1024 * 1024)
 
-    # convert the header to a clean JSON string
-    header_str   = json.dumps(header, separators=(",", ":"))
-    header_bytes = header_str.encode("utf-8")
+    # convert the header to a clean JSON utf8 string
+    output_header_bytes = json.dumps(output_header, separators=(",", ":")).encode("utf-8")
 
     # apply necessary padding to the header
-    header_end = HEADER_START_OFFSET + len(header_bytes)
-    remainder  = header_end % alignment
+    remainder = (HEADER_START_OFFSET + len(output_header_bytes)) % alignment
     if remainder > 0:
-        header_bytes = header_bytes + (b" " * (alignment - remainder))
+        output_header_bytes = output_header_bytes + (b" " * (alignment - remainder))
 
     # the total size of the header in Little-Endian (uint64)
-    header_size = len(header_bytes).to_bytes(8, byteorder="little", signed=False)
+    output_header_size = len(output_header_bytes).to_bytes(8, byteorder="little", signed=False)
 
     # write the final file by combining everything sequentially
     with open(output_safetensors_path, "wb") as f_out:
-        f_out.write(header_size)
-        f_out.write(header_bytes)
+        f_out.write(output_header_size)
+        f_out.write(output_header_bytes)
 
-        # calculate total size for progress tracking
-        total_size   = input_rawtensor_file.seek(0, 2)
-        written_size = 0
-        input_rawtensor_file.seek(0)
-        while chunk := input_rawtensor_file.read(COPY_CHUNK_SIZE):
-            f_out.write(chunk)
-            written_size += len(chunk)
+        # calculate the number of tensors for the progress bar
+        total_count = len(output_header)
+
+        # copy each tensor one by one in the order of the output header
+        for index, (tensor_name, tensor_data) in enumerate(output_header.items()):
             if progress is not None:
-                progress.update(written_size / total_size)
+                progress.update((index+1) / total_count)
+            if tensor_name.startswith('__'):
+                continue
+
+            # get source and destination offsets
+            sour_start, sour_end = sour_rawtensor_header.get(tensor_name, {}).get("data_offsets", (0, 0))
+            dest_start, dest_end = tensor_data.get("data_offsets", (0, 0))
+            tensor_size = sour_end - sour_start
+
+            # validate the consistency of the tensor size
+            if tensor_size <= 0:
+                raise ValueError(f"Tensor '{tensor_name}' is empty or with negative size. This could be a bug in the offset calculation.")
+            if tensor_size != (dest_end - dest_start):
+                raise ValueError(
+                    f"Tensor '{tensor_name}' has different sizes between source ({tensor_size} bytes) "
+                    f"and destination ({dest_end - dest_start} bytes). This is a bug in the offset calculation.")
+
+            # validate the alignment of the output file
+            # (the packed header + the relative offset of the tensor must match where the actual pointer is)
+            expected_pos = HEADER_START_OFFSET + len(output_header_bytes) + dest_start
+            if expected_pos != f_out.tell():
+                raise ValueError(
+                    f"Desalignment detected when writing '{tensor_name}'. "
+                    f"Current file position: {f_out.tell()}, Expected header position: {expected_pos}.")
+
+            # finally, copy the raw tensor data from source to destination
+            copy_raw_data(f_out, sour_rawtensor_file, source_offset=sour_start, byte_count=tensor_size, chunk_size=CHUNK_SIZE)
+
 
 
 def cast_tensor(tensor_name: str,
@@ -779,6 +896,12 @@ def main(args=None, parent_script=None):
     precision_group.add_argument('--i8convrot', action='store_const', const='I8CONVROT', dest='dtype', help="Set output precision to I8CONVROT.")
     parser.set_defaults(dtype='BF16')
 
+    sort_group = parser.add_mutually_exclusive_group()
+    sort_group.add_argument('--sort', action='store_true', dest='sort_tensors', default=True,
+                            help="Enable sorting of tensors by size in the output file (default).")
+    sort_group.add_argument('--no-sort', action='store_false', dest='sort_tensors',
+                            help="Disable sorting of tensors in the output file.")
+
     advanced_group = parser.add_argument_group('advanced options')
     advanced_group.add_argument('-c', '--clamp'  , type=str, metavar='LIMIT[:SHARPNESS]',
                                 help=("Apply value clipping to weights. Specify as 'limit' or 'limit:sharpness'.\n"
@@ -838,7 +961,7 @@ def main(args=None, parent_script=None):
         with tmp_context as tmp_rawtensor_file:
 
             progress_bar = ProgressBar()
-            safetensor_header = write_rawtensor_file(
+            tmp_rawtensor_header = write_rawtensor_file(
                                         tmp_rawtensor_file,
                                         input_files,
                                         format_name         = target_dtype,
@@ -847,14 +970,22 @@ def main(args=None, parent_script=None):
                                         clamp_sharpness     = clamp_sharpness,
                                         tensor_mapper       = TensorMapper(),
                                         progress            = progress_bar)
+
+            if parsed_args.sort_tensors:
+                message("Sorting tensors by size...")
+                safetensors_header = sort_safetensors_header(tmp_rawtensor_header)
+            else:
+                message("Skipping tensor sorting as requested.")
+                safetensors_header = copy.deepcopy(tmp_rawtensor_header)
+
             tmp_rawtensor_file.seek(0)
             progress_bar = ProgressBar()
             build_safetensors(output_path,
-                            input_rawtensor_file = tmp_rawtensor_file,
-                            header               = safetensor_header,
-                            alignment            = 64,
-                            progress             = progress_bar
-                            )
+                              output_header         = safetensors_header,
+                              sour_rawtensor_header = tmp_rawtensor_header,
+                              sour_rawtensor_file   = tmp_rawtensor_file,
+                              progress              = progress_bar
+                              )
 
     elif model == "qwen3-4b":
         error("qwen3-4b is not supported yet")
