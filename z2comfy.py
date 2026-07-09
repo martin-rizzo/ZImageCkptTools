@@ -15,9 +15,11 @@ import os
 import sys
 import copy
 import json
+import base64
 import tempfile
 import argparse
 from functools import lru_cache
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final, IO, cast
 if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv):
@@ -154,6 +156,67 @@ def copy_raw_data(f_out   : IO[bytes],
         bytes_left -= len(chunk)
 
 
+def create_safetensors_header(*,
+                              title         : str | None = None,
+                              author        : str | None = None,
+                              description   : str | None = None,
+                              date          : str | None = None,
+                              architecture  : str | None = None,
+                              tags          : str | None = None,
+                              resolution    : str | None = None,
+                              thumbnail_path: str | None = None,
+                              implementation: str | None = None,
+                              license       : str | None = None,
+                              spec_version  : str = "1.0.0"
+    ) -> dict[str, Any]:
+    """
+    Generate a compliant metadata dictionary for a .safetensors header.
+
+    Args:
+        title          : Unique identifier for the model.
+        author         : Creator of the model.
+        description    : Detailed information about the model.
+        date           : Creation date (ISO-8601). Defaults to current UTC time if None.
+        architecture   : Specific model architecture ID.
+        tags           : Comma-separated category labels.
+        resolution     : Base resolution for image generation.
+        thumbnail_path : Path to JPEG image for base64 encoding.
+        implementation : The codebase implementation.
+        license        : License terms or link.
+        spec_version   : Version of the ModelSpec standard (default: '1.0.0').
+
+    Returns:
+        A dictionary containing the '__metadata__' key.
+    """
+    if isinstance(date,str):
+        if date == "*" or date.lower() == "now":
+            date = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    fields = {
+        "modelspec.sai_model_spec": spec_version,
+        "modelspec.implementation": implementation,
+        "modelspec.title"         : title,
+        "modelspec.author"        : author,
+        "modelspec.description"   : description,
+        "modelspec.date"          : date,
+        "modelspec.architecture"  : architecture,
+        "modelspec.tags"          : tags,
+        "modelspec.resolution"    : resolution,
+        "modelspec.license"       : license
+    }
+
+    # filter out `None` values
+    filtered_metadata = {k: str(v) for k, v in fields.items() if v is not None}
+
+    # process thumbnail
+    if thumbnail_path and os.path.exists(thumbnail_path):
+        with open(thumbnail_path, "rb") as image_file:
+            encoded = base64.b64encode(image_file.read()).decode("utf-8")
+            filtered_metadata["modelspec.thumbnail"] = f"data:image/jpeg;base64,{encoded}"
+
+    return {"__metadata__": filtered_metadata}
+
+
 def sort_safetensors_header(safetensor_header: dict) -> dict:
     """
     Sorts the header of a safetensors file and recalculates data offsets.
@@ -248,7 +311,7 @@ class ProgressBar:
 
 #============================== TENSOR MAPPER ==============================#
 
-class TensorMapper:
+class ZImageTensorMapper:
     def __init__(self):
             self.replace_keys = {
                 "all_final_layer.2-1."      : "final_layer.",
@@ -638,39 +701,37 @@ def cast_tensor(tensor_name: str,
         raise ValueError(f"Unknown dtype: {cast_to}")
 
 
-def write_rawtensor_file(output_rawtensor_file: IO[bytes],
-                         input_file_paths     : list[Path],
-                         *,
-                         format_name         : str,
-                         stochastic_generator: np.random.Generator,
-                         tensor_mapper       : Callable    | None = None,
-                         clamp_limit         : float       | None = None,
-                         clamp_sharpness     : float       | None = None,
-                         progress            : ProgressBar | None = None
-                         ) -> SafetensorsHeader:
+def process_safetensors_file(input_safetensors_file: Path,
+                             output_rawtensor_file : IO[bytes],
+                             *,
+                             target_format        : str,
+                             stochastic_generator : np.random.Generator,
+                             tensor_mapper        : Callable | None = None,
+                             clamp_limit          : float | None    = None,
+                             clamp_sharpness      : float | None    = None,
+                             progress             : Any | None      = None
+                             ) -> SafetensorsHeader:
     """
-    Process tensors, cast them, and prepare binary data and header metadata for
-    future safetensors creation.
+    Process a tensor file, cast it, and append its binary data to the output file.
+    Returns the safetensors header for the processed tensors.
 
     Args:
         output_rawtensor_file: A binary file object where the processed tensor
-                               data will be written.
-        input_file_paths     : A list of paths to the input source files.
-        format_name          : (e.g., "f32", "f16", "bf16", "int8convrot",...).
+                               data will be appended.
+        input_file_path      : Path to the input source file.
+        target_format        : The target format (e.g., "FP32", "BF16", "I8CONVROT").
         stochastic_generator : A numpy random generator for stochastic rounding.
-        tensor_mapper        : An optional callable that takes (tensor_name, tensor)
-                               as input and returns a tuple of (new_name, new_tensor, is_quantizable),
-                               used for custom transformations or filtering.
+        tensor_mapper        : Optional callable for custom tensor transformations.
         clamp_limit          : Optional limit for tensor values clamping.
         clamp_sharpness      : Optional sharpness parameter for the clamping curve.
-        progress             : An optional progress bar object to track the
-                               processing status.
+        progress             : Optional progress bar object.
 
     Returns:
-        A dictionary (SafetensorsHeader) containing the metadata header structured
-        for safetensors compatibility, mapping tensor names to their respective
-        dtype, shape, and byte offsets.
+        A dict (SafetensorsHeader) containing the metadata for the processed tensors.
     """
+    if not input_safetensors_file.exists():
+        raise FileNotFoundError(f"File {input_safetensors_file} does not exist.")
+
     FORMAT_MAP = {
     # "FORMAT_NAME":( quantized_dtype,  dtype  )
         "FP32"     :( "FP32"         , "FP32"  ),
@@ -680,75 +741,66 @@ def write_rawtensor_file(output_rawtensor_file: IO[bytes],
         "BF16E"    :( "BF16E"        , "BF16E" ),
         "I8CONVROT":( "INT8CONVROT"  , "FP32"  ),
     }
-    format_name = format_name.upper()
-    if format_name not in FORMAT_MAP:
-        raise ValueError(f"Invalid `format_name` value: {format_name}")
-    quantized_dtype, dtype = FORMAT_MAP[format_name]
+    target_format = target_format.upper()
+    if target_format not in FORMAT_MAP:
+        raise ValueError(f"Invalid `format_name` value: {target_format}")
+    quantized_dtype, dtype = FORMAT_MAP[target_format]
 
-    # start from offset 0 as it is assumed that the raw binary information
-    # will be aligned when the final .safetensors is created
-    current_offset = 0
     header: SafetensorsHeader = {}
+    with safe_open(input_safetensors_file, framework="np", device="cpu") as f_in:
 
-    # validate that all input files exist before starting the process
-    for input_file in input_file_paths:
-        if not os.path.exists(input_file):
-            raise FileNotFoundError(f"File {input_file} does not exist.")
+        keys  = f_in.keys()
+        total = len(keys)
+        for i, tensor_name in enumerate(keys):
 
-    for input_file in input_file_paths:
-        with safe_open(input_file, framework="np", device="cpu") as f_in:
-            keys  = f_in.keys()
-            total = len(keys)
+            # get tensor info and transform it with the given `tensor_mapper`
+            tensor         = cast(np.ndarray, f_in.get_tensor(tensor_name))
+            is_quantizable = True
+            is_rotatable   = True
+            if (tensor_mapper is not None) and (tensor is not None):
+                tensor_name, tensor, is_quantizable = tensor_mapper(tensor_name, tensor)
 
-            for i, tensor_name in enumerate(keys):
-                tensor = cast(np.ndarray, f_in.get_tensor(tensor_name))
-                if tensor is None:
+            # discard null tensors
+            if not tensor_name or tensor is None:
+                continue
+
+            # clamp tensor if required by the user
+            if clamp_limit is not None:
+                tensor = softplus_clamp(tensor,
+                                        clamp_limit = clamp_limit,
+                                        sharpness   = clamp_sharpness if clamp_sharpness is not None else 1.2)
+
+            ## store min and max values of the data
+            #min, max = tensor.min(), tensor.max()
+            #if min<global_min: global_min = min
+            #if max>global_max: global_max = max
+
+            # cast tensor to the desired dtype,
+            # the result is a dictionary because some casting processes generate multiple tensors
+            cast_to = quantized_dtype if is_quantizable else dtype
+            out_tensor_dict = cast_tensor(tensor_name, tensor, cast_to=cast_to, stochastic_generator=stochastic_generator)
+
+            # convert casted tensor to bytes and store them in `output_rawtensor_file`
+            for out_tensor_name, out_tensor in out_tensor_dict.items():
+                if not isinstance(out_tensor, np.ndarray):
                     continue
+                out_bytes = out_tensor.tobytes()
+                out_start = output_rawtensor_file.tell()
+                out_end   = out_start + len(out_bytes)
+                out_shape = list(out_tensor.shape)
 
-                # apply mapping/transformation to tensor
-                if tensor_mapper is not None:
-                    tensor_name, tensor, is_quantizable = tensor_mapper(tensor_name, tensor)
-                if not tensor_name or tensor is None:
-                    continue
+                # record metadata for the header
+                header[out_tensor_name] = {
+                    "dtype"       : SAFETENSORS_DTYPES[out_tensor.dtype],
+                    "shape"       : out_shape,
+                    "data_offsets": [out_start, out_end]
+                }
 
-                # clamp tensor if required by the user
-                if clamp_limit is not None:
-                    tensor = softplus_clamp(tensor,
-                                            clamp_limit = clamp_limit,
-                                            sharpness   = clamp_sharpness if clamp_sharpness is not None else 1.2)
+                # write raw bytes
+                output_rawtensor_file.write(out_bytes)
 
-                ## store min and max values of the data
-                #min, max = tensor.min(), tensor.max()
-                #if min<global_min: global_min = min
-                #if max>global_max: global_max = max
-
-                # cast tensor to the desired dtype,
-                # the result is a dictionary because some casting processes generate multiple tensors
-                cast_to = quantized_dtype if is_quantizable else dtype
-                out_tensor_dict = cast_tensor(tensor_name, tensor, cast_to=cast_to, stochastic_generator=stochastic_generator)
-
-                # convert casted tensor to bytes and store them in `output_rawtensor_file`
-                for out_tensor_name, out_tensor in out_tensor_dict.items():
-                    if not isinstance(out_tensor, np.ndarray):
-                        continue
-                    out_bytes = out_tensor.tobytes()
-                    out_start = current_offset
-                    out_end   = out_start + len(out_bytes)
-                    out_shape = list(out_tensor.shape)
-
-                    # record metadata for the header
-                    header[out_tensor_name] = {
-                        "dtype"       : SAFETENSORS_DTYPES[out_tensor.dtype],
-                        "shape"       : out_shape,
-                        "data_offsets": [out_start, out_end]
-                    }
-
-                    # write raw bytes
-                    output_rawtensor_file.write(out_bytes)
-                    current_offset = out_end
-
-                if progress is not None:
-                    progress.update((i + 1) / total)
+            if progress is not None:
+                progress.update((i + 1) / total)
 
     return header
 
@@ -885,7 +937,13 @@ def main(args=None, parent_script=None):
     parser.add_argument('input_files', nargs='+', metavar='INPUT', help="One or more input safetensors files to process.")
     parser.add_argument('-o', '--output' , default='z_image_turbo.safetensors', help="Output safetensors file path.")
     parser.add_argument('-l', '--low-ram', action="store_true", help="Write temporary data to disk instead of RAM, useful for low-memory environments.")
+    sort_group = parser.add_mutually_exclusive_group()
+    sort_group.add_argument('--sort', action='store_true', dest='sort_tensors', default=True,
+                            help="Enable sorting of tensors by size in the output file (default).")
+    sort_group.add_argument('--no-sort', action='store_false', dest='sort_tensors',
+                            help="Disable sorting of tensors in the output file.")
 
+    #-- Precision & Quantization Options --------
     precision_main_group = parser.add_argument_group('precision & quantization options')
     precision_group = precision_main_group.add_mutually_exclusive_group()
     precision_group.add_argument('--fp32'     , action='store_const', const='FP32'     , dest='dtype', help="Set output precision to F32.")
@@ -896,22 +954,47 @@ def main(args=None, parent_script=None):
     precision_group.add_argument('--i8convrot', action='store_const', const='I8CONVROT', dest='dtype', help="Set output precision to I8CONVROT.")
     parser.set_defaults(dtype='BF16')
 
-    sort_group = parser.add_mutually_exclusive_group()
-    sort_group.add_argument('--sort', action='store_true', dest='sort_tensors', default=True,
-                            help="Enable sorting of tensors by size in the output file (default).")
-    sort_group.add_argument('--no-sort', action='store_false', dest='sort_tensors',
-                            help="Disable sorting of tensors in the output file.")
+    #-- Metadata options group ------------------
+    meta_group = parser.add_argument_group('safetensors metadata options')
+    meta_group.add_argument('--title'      , metavar='TITLE'  , help="Model title for the safetensors header.")
+    meta_group.add_argument('--author'     , metavar='AUTHOR' , help="Author name for the safetensors header.")
+    meta_group.add_argument('--description', metavar='TEXT'   , help="Model description for the header.")
+    meta_group.add_argument('--license'    , metavar='LICENSE', help="License info for the safetensors header.")
+    meta_group.add_argument('--thumbnail'  , metavar='PATH'   , help="Path to the thumbnail image file to include in the header.")
 
+    #-- Advanced options ------------------------
     advanced_group = parser.add_argument_group('advanced options')
-    advanced_group.add_argument('-c', '--clamp'  , type=str, metavar='LIMIT[:SHARPNESS]',
+    advanced_group.add_argument('--clamp'  , type=str, metavar='LIMIT[:SHARPNESS]',
                                 help=("Apply value clipping to weights. Specify as 'limit' or 'limit:sharpness'.\n"
                                       "Example: '7.0:0.8' to set limit 7.0 with a sharpness factor of 0.8."))
-    advanced_group.add_argument('-s', '--seed', type=int, default=100, metavar='N',
+    advanced_group.add_argument('--seed', type=int, default=100, metavar='N',
                                 help=("This value is used with types involving stochastic rounding, such as --fp16e or --bf16e.\n"
                                       "Setting a fixed seed ensures reproducible results. Default: 100."))
+
     parsed_args = parser.parse_args(args=args)
 
-    # determine target dtype
+    # check input files and determine model class
+    input_files, model = validate_and_collect_safetensors(parsed_args.input_files)
+    input_file_count = len(input_files)
+
+    # validate model class
+    #  - diffusion model -> "z-image"
+    #  - text encoder    -> "qwen-3b"
+    if model == "z-image":
+        tensor_mapper = ZImageTensorMapper()
+        output_name   = 'z_image_turbo.safetensors'
+
+    elif model == "qwen3-4b":
+        # tensor_mapper = Qwen3TensorMapper()
+        # output_name   = 'qwen3-4b.safetensors'
+        error("qwen3-4b is not supported yet")
+        exit(1)
+
+    else:
+        error("Unknown model")
+        exit(1)
+
+    # determine target data type
     target_dtype = parsed_args.dtype
 
     # determine the clamp parameters (if any)
@@ -931,9 +1014,6 @@ def main(args=None, parent_script=None):
     new_filename = f"{output_path.stem}_{target_dtype.lower()}{clamping_tag}{output_path.suffix}"
     output_path = output_path.with_name(new_filename)
 
-    # check input files
-    input_files, model = validate_and_collect_safetensors(parsed_args.input_files)
-    input_file_count = len(input_files)
 
     # create the RNG for stochastic rounding
     stochastic_generator = np.random.default_rng(parsed_args.seed)
@@ -956,44 +1036,55 @@ def main(args=None, parent_script=None):
         message("Using in-memory buffer for temporary data.")
         tmp_context = io.BytesIO()
 
+    # generate the initial info of the safetensors header
+    safetensors_header = create_safetensors_header(
+        title       = parsed_args.title       or "Z-Image/Z-Image-Turbo",
+        author      = parsed_args.author      or "Alibaba Tongyi Lab",
+        license     = parsed_args.license     or "Apache-2.0",
+        description = parsed_args.description or (
+            "Z-Image is a 6B parameter image generation model based on a "
+            "Scalable Single-Stream DiT (S3-DiT) architecture. Optimized to "
+            "generate high-quality images, it stands out for its excellent "
+            "bilingual (English and Chinese) text rendering capabilities."
+        ),
+        thumbnail_path = parsed_args.thumbnail,
+        architecture   = "z-image-v1",
+        tags           = "Image Generation, S3-DiT, Bilingual, English, Chinese",
+        resolution     = "1024x1024",
+        date           = "*")
 
-    if model == "z-image":
-        with tmp_context as tmp_rawtensor_file:
 
+    # PROCESS!!
+    with tmp_context as tmp_rawtensor_file:
+
+        for input_file in input_files:
             progress_bar = ProgressBar()
-            tmp_rawtensor_header = write_rawtensor_file(
+            safetensors_header |= process_safetensors_file(
+                                        input_file,
                                         tmp_rawtensor_file,
-                                        input_files,
-                                        format_name         = target_dtype,
+                                        target_format         = target_dtype,
                                         stochastic_generator= stochastic_generator,
                                         clamp_limit         = clamp_limit,
                                         clamp_sharpness     = clamp_sharpness,
-                                        tensor_mapper       = TensorMapper(),
+                                        tensor_mapper       = tensor_mapper,
                                         progress            = progress_bar)
 
-            if parsed_args.sort_tensors:
-                message("Sorting tensors by size...")
-                safetensors_header = sort_safetensors_header(tmp_rawtensor_header)
-            else:
-                message("Skipping tensor sorting as requested.")
-                safetensors_header = copy.deepcopy(tmp_rawtensor_header)
+        if parsed_args.sort_tensors:
+            message("Sorting tensors by size...")
+            output_header = sort_safetensors_header(safetensors_header)
+        else:
+            message("Skipping tensor sorting as requested.")
+            output_header = copy.deepcopy(safetensors_header)
 
-            tmp_rawtensor_file.seek(0)
-            progress_bar = ProgressBar()
-            build_safetensors(output_path,
-                              output_header         = safetensors_header,
-                              sour_rawtensor_header = tmp_rawtensor_header,
-                              sour_rawtensor_file   = tmp_rawtensor_file,
-                              progress              = progress_bar
-                              )
+        tmp_rawtensor_file.seek(0)
+        progress_bar = ProgressBar()
+        build_safetensors(output_path,
+                            output_header         = output_header,
+                            sour_rawtensor_header = safetensors_header,
+                            sour_rawtensor_file   = tmp_rawtensor_file,
+                            progress              = progress_bar
+                            )
 
-    elif model == "qwen3-4b":
-        error("qwen3-4b is not supported yet")
-        exit(1)
-
-    else:
-        error("Unknown model")
-        exit(1)
 
 
 if __name__ == "__main__":
