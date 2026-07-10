@@ -261,6 +261,33 @@ def sort_safetensors_header(safetensor_header: dict) -> dict:
     return new_header
 
 
+def detect_model_architecture(input_files: list[Path]) -> str:
+    """Detect the model architecture by tracking unique identified suffixes.
+    Args:
+        input_files: A list of file paths pointing to the model safetensors files.
+    Returns:
+        A string indicating the detected architecture: "z-image", "qwen3-4b", or "unknown".
+    """
+    # known suffix sets for each architecture
+    Z_IMAGE_SUFFIXES = {"x_pad_token", "cap_pad_token", "layers.27.feed_forward.w2.weight"}
+    QWEN_SUFFIXES    = {"model.embed_tokens.weight", "layers.0.mlp.down_proj.weight", "layers.29.self_attn.q_proj.weight"}
+
+    found_z_suffixes, found_qwen_suffixes = set(), set()
+    for file_path in input_files:
+        with safe_open(file_path, framework="np", device="cpu") as f:
+            for tensor_name in f.keys():
+                for suffix in Z_IMAGE_SUFFIXES:
+                    if tensor_name.endswith(suffix): found_z_suffixes.add(suffix)
+
+                for suffix in QWEN_SUFFIXES:
+                    if tensor_name.endswith(suffix): found_qwen_suffixes.add(suffix)
+
+    # check if all required suffixes were found
+    if found_z_suffixes    == Z_IMAGE_SUFFIXES: return "z-image"
+    if found_qwen_suffixes == QWEN_SUFFIXES   : return "qwen3-4b"
+    return "unknown"
+
+
 #============================== PROGRESS BAR ===============================#
 
 class ProgressBar:
@@ -368,6 +395,26 @@ class ZImageTensorMapper:
             tensor_name = tensor_name.replace(old_key, new_key)
 
         is_rotatable = all(unquant not in tensor_name for unquant in self.unquantizables)
+        if tensor.ndim != 2:
+            is_rotatable = False
+        return tensor_name, tensor, is_rotatable
+
+
+class Qwen3TensorMapper:
+    def __init__(self):
+            self.unrotatable = [ 'embed_tokens' ]
+
+    def __call__(self, tensor_name: str, tensor: np.ndarray) -> tuple[str|None, np.ndarray|None, bool]:
+
+        ## omit tensors that cause conflicts or are unnecessary
+        #if tensor_name.endswith("???"):
+        #    return None, None, False
+
+        # rename tensor by replacing old keys with new ones
+        #for old_key, new_key in self.replace_keys.items():
+        #    tensor_name = tensor_name.replace(old_key, new_key)
+
+        is_rotatable = all(unquant not in tensor_name for unquant in self.unrotatable)
         if tensor.ndim != 2:
             is_rotatable = False
         return tensor_name, tensor, is_rotatable
@@ -862,7 +909,7 @@ def make_clamping_tag(limit: float | None, sharpness: float | None) -> str:
 #////////////////////////////////// MAIN ///////////////////////////////////#
 #===========================================================================#
 
-def validate_and_collect_safetensors(input_files: list[str | Path]) -> tuple[list[Path], str]:
+def validate_and_collect_safetensors(input_files: list[str | Path]) -> list[Path]:
     """
     Validate input paths and collect safetensors files from a directory or list.
 
@@ -870,8 +917,7 @@ def validate_and_collect_safetensors(input_files: list[str | Path]) -> tuple[lis
         input_files: A list of paths provided by the user via command line,
                      pointing to files or a single directory.
     Returns:
-        A tuple containing a list of validated Path objects to safetensors
-        files and the detected model type as a string.
+        A list of validated Path objects to safetensors files.
     """
     paths      : list[Path] = [Path(f) for f in input_files]
     valid_files: list[Path] = []
@@ -907,7 +953,7 @@ def validate_and_collect_safetensors(input_files: list[str | Path]) -> tuple[lis
     if not valid_files:
         raise ValueError(f"No valid .safetensors files.")
 
-    return valid_files, "z-image"
+    return valid_files
 
 
 def main(args=None, parent_script=None):
@@ -935,7 +981,7 @@ def main(args=None, parent_script=None):
     )
 
     parser.add_argument('input_files', nargs='+', metavar='INPUT', help="One or more input safetensors files to process.")
-    parser.add_argument('-o', '--output' , default='z_image_turbo.safetensors', help="Output safetensors file path.")
+    parser.add_argument('-o', '--output' , help="Output safetensors file path.")
     parser.add_argument('-l', '--low-ram', action="store_true", help="Write temporary data to disk instead of RAM, useful for low-memory environments.")
     sort_group = parser.add_mutually_exclusive_group()
     sort_group.add_argument('--sort', action='store_true', dest='sort_tensors', default=True,
@@ -974,21 +1020,20 @@ def main(args=None, parent_script=None):
     parsed_args = parser.parse_args(args=args)
 
     # check input files and determine model class
-    input_files, model = validate_and_collect_safetensors(parsed_args.input_files)
+    input_files      = validate_and_collect_safetensors(parsed_args.input_files)
     input_file_count = len(input_files)
+    model = detect_model_architecture(input_files)
 
     # validate model class
     #  - diffusion model -> "z-image"
     #  - text encoder    -> "qwen-3b"
     if model == "z-image":
         tensor_mapper = ZImageTensorMapper()
-        output_name   = 'z_image_turbo.safetensors'
+        default_name  = 'z_image_turbo.safetensors'
 
     elif model == "qwen3-4b":
-        # tensor_mapper = Qwen3TensorMapper()
-        # output_name   = 'qwen3-4b.safetensors'
-        error("qwen3-4b is not supported yet")
-        exit(1)
+        tensor_mapper = Qwen3TensorMapper()
+        default_name  = 'qwen3-4b.safetensors'
 
     else:
         error("Unknown model")
@@ -1007,7 +1052,7 @@ def main(args=None, parent_script=None):
     clamping_tag = make_clamping_tag(clamp_limit, clamp_sharpness)
 
     # build path to the output safetensors file
-    output_path  = Path(parsed_args.output)
+    output_path  = Path(parsed_args.output or default_name)
     if not output_path.suffix:
         output_path = output_path.with_suffix(".safetensors")
 
