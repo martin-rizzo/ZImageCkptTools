@@ -28,7 +28,7 @@ if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv
     import numpy.typing as npt
     import ml_dtypes
     from typing      import Callable, Any
-    from safetensors import safe_open
+    from safetensors import safe_open as safetensors_open
 
     # Constant to avoid division by zero in Float32 operations.
     # Equivalent to the smallest representable normalized positive number.
@@ -54,7 +54,7 @@ if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv
         np.dtype(ml_dtypes.float8_e5m2  ): "F8_E5M2",
     }
 
-    # Defines the size in bytes for each supported safetensors data type identifier
+    # The size in bytes for each supported safetensors data type identifier
     SAFETENSORS_DTYPE_SIZES: Final = {
         "F64": 8, "I64": 8, "U64": 8,
         "F32": 4, "I32": 4, "U32": 4,
@@ -62,6 +62,19 @@ if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv
         "F8_E4M3": 1, "F8_E5M2": 1, "I8": 1, "U8": 1, "BOOL": 1
     }
 
+    # Properties for each internal data type, including whether
+    # it requires to be quantized, rotated, and a corresponding file tag.
+    DTYPE_PROPERTIES = {
+    #  DTYPE         :(quantized, rotated,  tag            ),
+        "FP32"       :( False ,    False  , "fp32"         ),
+        "FP16"       :( False ,    False  , "fp16"         ),
+        "FP16E"      :( False ,    False  , "fp16e"        ),
+        "BF16"       :( False ,    False  , "bf16"         ),
+        "BF16E"      :( False ,    False  , "bf16e"        ),
+        "FP8SCALED"  :( True  ,    False  , "fp8_scaled"   ),
+        "INT8CONVROT":( True  ,    True   , "int8_convrot" ),
+        "INT4CONVROT":( True  ,    True   , "int4_convrot" ),
+    }
 
 
 # Safetensors Header Structure
@@ -274,8 +287,8 @@ def detect_model_architecture(input_files: list[Path]) -> str:
 
     found_z_suffixes, found_qwen_suffixes = set(), set()
     for file_path in input_files:
-        with safe_open(file_path, framework="np", device="cpu") as f:
-            for tensor_name in f.keys():
+        with safetensors_open(file_path, framework="np", device="cpu") as safetensors_file:
+            for tensor_name in safetensors_file.keys():
                 for suffix in Z_IMAGE_SUFFIXES:
                     if tensor_name.endswith(suffix): found_z_suffixes.add(suffix)
 
@@ -420,7 +433,7 @@ class Qwen3TensorMapper:
         return tensor_name, tensor, is_rotatable
 
 
-#============================= PROCESS TENSORS =============================#
+#============================== QUANTIZATION ===============================#
 
 @lru_cache(maxsize=8)
 def build_hadamard(size: int, dtype: npt.DTypeLike | None = None) -> np.ndarray:
@@ -453,8 +466,7 @@ def rotate_tensor(tensor      : np.ndarray,
                   h_matrix    : np.ndarray,
                   group_size  : int,
                   ) -> np.ndarray:
-    """
-    Rotate a tensor matrix offline: T_rot = T @ H^T.
+    """Rotate a tensor matrix offline: T_rot = T @ H^T.
 
     For a Linear(in_features, out_features) layer with a tensor shape (out_features, in_features):
     Each row of the tensor is split into groups of group_size and rotated by H^T.
@@ -488,7 +500,6 @@ def rotate_tensor(tensor      : np.ndarray,
     return rotated_grouped.reshape(out_features, in_features)
 
 
-
 def to_int8(tensor: np.ndarray, *,
             stochastic_generator: np.random.Generator | None = None
             ) -> np.ndarray:
@@ -514,8 +525,7 @@ def to_int8(tensor: np.ndarray, *,
 
 
 def build_metadata_tensor(**metadata: Any) -> np.ndarray:
-    """
-    Construct a UINT8 numpy tensor containing serialized metadata for ComfyUI.
+    """Construct a UINT8 numpy tensor containing serialized metadata for ComfyUI.
 
     This function acts as a factory, taking arbitrary keyword arguments,
     serializing them into JSON, and returning them as a byte-based tensor
@@ -744,34 +754,40 @@ def cast_tensor(tensor_name: str,
             f"{tensor_name}_scale" : scales,
             f"{parent}.comfy_quant": comfy_quant }
 
+    elif cast_to == "INT4CONVROT":
+        comfy_quant = build_metadata_tensor( format="convrot_w4a4", convrot_groupsize=CONVROT_GROUP_SIZE )
+        raise NotImplementedError(f"Conversion to {cast_to} is not implemented yet")
+
     else:
         raise ValueError(f"Unknown dtype: {cast_to}")
 
 
-def process_safetensors_file(input_safetensors_file: Path,
+def convert_safetensors_file(input_safetensors_file: Path,
                              output_rawtensor_file : IO[bytes],
                              *,
-                             target_format        : str,
-                             stochastic_generator : np.random.Generator,
-                             tensor_mapper        : Callable | None = None,
-                             clamp_limit          : float | None    = None,
-                             clamp_sharpness      : float | None    = None,
-                             progress             : Any | None      = None
+                             target_dtype         : str,
+                             high_precision_dtype : str | None                 = None,
+                             stochastic_generator : np.random.Generator | None = None,
+                             tensor_mapper        : Callable | None            = None,
+                             clamp_limit          : float | None               = None,
+                             clamp_sharpness      : float | None               = None,
+                             progress             : Any | None                 = None
                              ) -> SafetensorsHeader:
     """
     Process a tensor file, cast it, and append its binary data to the output file.
     Returns the safetensors header for the processed tensors.
 
     Args:
-        output_rawtensor_file: A binary file object where the processed tensor
-                               data will be appended.
-        input_file_path      : Path to the input source file.
-        target_format        : The target format (e.g., "FP32", "BF16", "I8CONVROT").
-        stochastic_generator : A numpy random generator for stochastic rounding.
-        tensor_mapper        : Optional callable for custom tensor transformations.
-        clamp_limit          : Optional limit for tensor values clamping.
-        clamp_sharpness      : Optional sharpness parameter for the clamping curve.
-        progress             : Optional progress bar object.
+        output_rawtensor_file : A binary file object where the processed tensor
+                                data will be appended.
+        input_safetensors_file: Path to the input source file.
+        target_dtype          : The target format (e.g., "FP32", "BF16", "INT8CONVROT").
+        high_precision_dtype  : The high precision data type to use if the target dtype cannot be quantized.
+        stochastic_generator  : A numpy random generator for stochastic rounding.
+        tensor_mapper         : Optional callable for custom tensor transformations.
+        clamp_limit           : Optional limit for tensor values clamping.
+        clamp_sharpness       : Optional sharpness parameter for the clamping curve.
+        progress              : Optional progress bar object.
 
     Returns:
         A dict (SafetensorsHeader) containing the metadata for the processed tensors.
@@ -779,35 +795,37 @@ def process_safetensors_file(input_safetensors_file: Path,
     if not input_safetensors_file.exists():
         raise FileNotFoundError(f"File {input_safetensors_file} does not exist.")
 
-    FORMAT_MAP = {
-    # "FORMAT_NAME":( quantized_dtype,  dtype  )
-        "FP32"     :( "FP32"         , "FP32"  ),
-        "FP16"     :( "FP16"         , "FP16"  ),
-        "FP16E"    :( "FP16E"        , "FP16E" ),
-        "BF16"     :( "BF16"         , "BF16"  ),
-        "BF16E"    :( "BF16E"        , "BF16E" ),
-        "I8CONVROT":( "INT8CONVROT"  , "FP32"  ),
-    }
-    target_format = target_format.upper()
-    if target_format not in FORMAT_MAP:
-        raise ValueError(f"Invalid `format_name` value: {target_format}")
-    quantized_dtype, dtype = FORMAT_MAP[target_format]
+    # initialize the stochastic generator if it's not provided
+    if stochastic_generator is None:
+        stochastic_generator = np.random.default_rng()
+
+    # set the high precision dtype if not provided
+    if high_precision_dtype is None:
+        high_precision_dtype = "FP32"
+
+    # convert target dtype to uppercase
+    target_dtype = target_dtype.upper()
+    if target_dtype not in DTYPE_PROPERTIES:
+        raise ValueError(f"Invalid `target_dtype` value: {target_dtype}")
+    req_quantization, req_rotation, tag = DTYPE_PROPERTIES[target_dtype]
+
+
 
     header: SafetensorsHeader = {}
-    with safe_open(input_safetensors_file, framework="np", device="cpu") as f_in:
+    with safetensors_open(input_safetensors_file, framework="np", device="cpu") as safetensors_file:
 
-        keys  = f_in.keys()
+        keys  = safetensors_file.keys()
         total = len(keys)
         for i, tensor_name in enumerate(keys):
 
             # get tensor info and transform it with the given `tensor_mapper`
-            tensor         = cast(np.ndarray, f_in.get_tensor(tensor_name))
+            tensor         = cast(np.ndarray, safetensors_file.get_tensor(tensor_name))
             is_quantizable = True
             is_rotatable   = True
             if (tensor_mapper is not None) and (tensor is not None):
                 tensor_name, tensor, is_quantizable = tensor_mapper(tensor_name, tensor)
 
-            # discard null tensors
+            # discard null tensors that may have been generated by the `tensor_mapper`
             if not tensor_name or tensor is None:
                 continue
 
@@ -817,14 +835,13 @@ def process_safetensors_file(input_safetensors_file: Path,
                                         clamp_limit = clamp_limit,
                                         sharpness   = clamp_sharpness if clamp_sharpness is not None else 1.2)
 
-            ## store min and max values of the data
-            #min, max = tensor.min(), tensor.max()
-            #if min<global_min: global_min = min
-            #if max>global_max: global_max = max
+            # determine the target dtype for the tensor based on its properties
+            cast_to = target_dtype
+            if req_quantization:
+                cast_to = target_dtype if is_quantizable else high_precision_dtype
 
             # cast tensor to the desired dtype,
-            # the result is a dictionary because some casting processes generate multiple tensors
-            cast_to = quantized_dtype if is_quantizable else dtype
+            # the result is a dictionary because some casting processes generate multiple tensors for ComfyUI
             out_tensor_dict = cast_tensor(tensor_name, tensor, cast_to=cast_to, stochastic_generator=stochastic_generator)
 
             # convert casted tensor to bytes and store them in `output_rawtensor_file`
@@ -992,12 +1009,16 @@ def main(args=None, parent_script=None):
     #-- Precision & Quantization Options --------
     precision_main_group = parser.add_argument_group('precision & quantization options')
     precision_group = precision_main_group.add_mutually_exclusive_group()
-    precision_group.add_argument('--fp32'     , action='store_const', const='FP32'     , dest='dtype', help="Set output precision to F32.")
-    precision_group.add_argument('--fp16'     , action='store_const', const='FP16'     , dest='dtype', help="Set output precision to F16.")
-    precision_group.add_argument('--bf16'     , action='store_const', const='BF16'     , dest='dtype', help="Set output precision to BF16 (default).")
-    precision_group.add_argument('--fp16e'    , action='store_const', const='FP16E'    , dest='dtype', help="Set output precision to FP16 with stochastic rounding.")
-    precision_group.add_argument('--bf16e'    , action='store_const', const='BF16E'    , dest='dtype', help="Set output precision to BF16 with stochastic rounding.")
-    precision_group.add_argument('--i8convrot', action='store_const', const='I8CONVROT', dest='dtype', help="Set output precision to I8CONVROT.")
+    precision_group.add_argument('--fp32'       , action='store_const', const='FP32'       , dest='dtype', help="Set output precision to F32.")
+    precision_group.add_argument('--fp16'       , action='store_const', const='FP16'       , dest='dtype', help="Set output precision to F16.")
+    precision_group.add_argument('--bf16'       , action='store_const', const='BF16'       , dest='dtype', help="Set output precision to BF16 (default).")
+    precision_group.add_argument('--fp16e'      , action='store_const', const='FP16E'      , dest='dtype', help="Set output precision to FP16 with stochastic rounding.")
+    precision_group.add_argument('--bf16e'      , action='store_const', const='BF16E'      , dest='dtype', help="Set output precision to BF16 with stochastic rounding.")
+    precision_group.add_argument('--int8convrot', action='store_const', const='INT8CONVROT', dest='dtype', help="Set output precision to INT8 using row-wise ConvRot to preserve BF16 quality.")
+    precision_group.add_argument('--int4convrot', action='store_const', const='INT4CONVROT', dest='dtype', help="Set output precision to INT4 using row-wise ConvRot for maximum VRAM savings and speed.")
+    precision_main_group.add_argument('--mixed-dtype', type=lambda s: s.upper(), choices=['FP32', 'FP16', 'BF16', 'FP16E', 'BF16E'], metavar='TYPE',
+                                      help="High precision data type used alongside quantized formats. Default: FP32.")
+
     parser.set_defaults(dtype='BF16')
 
     #-- Metadata options group ------------------
@@ -1041,6 +1062,18 @@ def main(args=None, parent_script=None):
 
     # determine target data type
     target_dtype = parsed_args.dtype
+    req_quantization, _, dtype_tag = DTYPE_PROPERTIES[target_dtype]
+
+    # determine the high precision data type (default to FP32)
+    if req_quantization:
+        mixed_dtype = parsed_args.mixed_dtype or 'FP32'
+        mixed_tag   = f"_{mixed_dtype.lower()}mixed"
+    else:
+        mixed_dtype = None
+        mixed_tag   = ""
+        if parsed_args.mixed_dtype is not None:
+            warning("--mixed-dtype is only supported for quantized models, it will be ignored")
+
 
     # determine the clamp parameters (if any)
     clamp_limit, clamp_sharpness = None, None
@@ -1056,7 +1089,7 @@ def main(args=None, parent_script=None):
     if not output_path.suffix:
         output_path = output_path.with_suffix(".safetensors")
 
-    new_filename = f"{output_path.stem}_{target_dtype.lower()}{clamping_tag}{output_path.suffix}"
+    new_filename = f"{output_path.stem}_{dtype_tag}{mixed_tag}{clamping_tag}{output_path.suffix}"
     output_path = output_path.with_name(new_filename)
 
 
@@ -1065,9 +1098,11 @@ def main(args=None, parent_script=None):
 
 
     # print configuration details
-    clamp_limit_str = f"{clamp_limit} (sharpness {clamp_sharpness})" if clamp_limit is not None else "none"
+    clamp_limit_str = f"{clamp_limit} (sharpness {clamp_sharpness})" if clamp_limit is not None else "-"
     message(f"Model            : {model.upper()}")
     message(f"Target Data Type : {target_dtype.upper()}")
+    if isinstance(mixed_dtype,str):
+        message(f"Mixed Data Type  : {mixed_dtype.upper()}")
     message(f"Clamping Value   : {clamp_limit_str}")
     message(f"Stochastic Seed  : {parsed_args.seed}")
     message(f"Input            : {input_file_count} safetenstensors {'file' if input_file_count == 1 else 'files'}")
@@ -1104,15 +1139,16 @@ def main(args=None, parent_script=None):
 
         for input_file in input_files:
             progress_bar = ProgressBar()
-            safetensors_header |= process_safetensors_file(
+            safetensors_header |= convert_safetensors_file(
                                         input_file,
                                         tmp_rawtensor_file,
-                                        target_format         = target_dtype,
-                                        stochastic_generator= stochastic_generator,
-                                        clamp_limit         = clamp_limit,
-                                        clamp_sharpness     = clamp_sharpness,
-                                        tensor_mapper       = tensor_mapper,
-                                        progress            = progress_bar)
+                                        target_dtype         = target_dtype,
+                                        high_precision_dtype = mixed_dtype,
+                                        stochastic_generator = stochastic_generator,
+                                        clamp_limit          = clamp_limit,
+                                        clamp_sharpness      = clamp_sharpness,
+                                        tensor_mapper        = tensor_mapper,
+                                        progress             = progress_bar)
 
         if parsed_args.sort_tensors:
             message("Sorting tensors by size...")
