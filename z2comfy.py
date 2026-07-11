@@ -352,7 +352,20 @@ class ProgressBar:
 #============================== TENSOR MAPPER ==============================#
 
 class ZImageTensorMapper:
-    def __init__(self):
+    def __init__(self, *, aggressive_quantization: bool = False):
+
+            if aggressive_quantization:
+                unquantizables = [
+                    'cap_pad_token', 'cap_embedder', 't_embedder', 'x_embedder', 'x_pad_token',
+                ]
+            else:
+                unquantizables = [
+                    'cap_pad_token', 'cap_embedder', 't_embedder', 'x_embedder', 'x_pad_token',
+                    'context_refiner', 'final_layer', 'noise_refiner', 'adaLN',
+                    'layers.0.',
+                ]
+
+
             self.replace_keys = {
                 "all_final_layer.2-1."      : "final_layer.",
                 "all_x_embedder.2-1."       : "x_embedder.",
@@ -361,11 +374,7 @@ class ZImageTensorMapper:
                 ".attention.norm_q.weight"  : ".attention.q_norm.weight",
                 ".attention.to_out.0.weight": ".attention.out.weight"
             }
-            self.unquantizables = [
-                'cap_embedder', 't_embedder', 'x_embedder', 'cap_pad_token', 'context_refiner',
-                'final_layer', 'noise_refiner', 'adaLN',
-                'x_pad_token', 'layers.0.',
-            ]
+            self.unquantizables = unquantizables
             self.qkv_buffers = {}
 
     def __call__(self, tensor_name: str, tensor: np.ndarray) -> tuple[str|None, np.ndarray|None, bool]:
@@ -1009,7 +1018,7 @@ def main(args=None, parent_script=None):
     """
     prog = None
     if parent_script:
-        prog = parent_script + " " + os.path.basename(__file__).split('.')
+        prog = f"{parent_script} {os.path.splitext(os.path.basename(__file__))[0]}"
 
     parser = argparse.ArgumentParser(
         prog        = prog,
@@ -1043,6 +1052,8 @@ def main(args=None, parent_script=None):
     precision_group.add_argument('--bf16e'      , action='store_const', const='BF16E'      , dest='dtype', help="Set output precision to BF16 with stochastic rounding.")
     precision_group.add_argument('--int8convrot', action='store_const', const='INT8CONVROT', dest='dtype', help="Set output precision to INT8 using row-wise ConvRot to preserve BF16 quality.")
     precision_group.add_argument('--int4convrot', action='store_const', const='INT4CONVROT', dest='dtype', help="Set output precision to INT4 using row-wise ConvRot for maximum VRAM savings and speed.")
+    precision_main_group.add_argument('--mixed-small', action='store_true',
+                                    help="Quantize aggressively for faster speeds at the cost of some quality.")
     precision_main_group.add_argument('--mixed-dtype', type=lambda s: s.upper(), choices=['FP32', 'FP16', 'BF16', 'FP16E', 'BF16E'], metavar='TYPE',
                                       help="High precision data type used alongside quantized formats. Default: FP32.")
     precision_main_group.add_argument('--qscales-dtype', type=lambda s: s.upper(), choices=['FP32', 'FP16', 'BF16', 'FP16E', 'BF16E'], metavar='TYPE',
@@ -1074,36 +1085,26 @@ def main(args=None, parent_script=None):
     input_file_count = len(input_files)
     model = detect_model_architecture(input_files)
 
-    # validate model class
-    #  - diffusion model -> "z-image"
-    #  - text encoder    -> "qwen-3b"
-    if model == "z-image":
-        tensor_mapper = ZImageTensorMapper()
-        default_name  = 'z_image_turbo.safetensors'
-
-    elif model == "qwen3-4b":
-        tensor_mapper = Qwen3TensorMapper()
-        default_name  = 'qwen3-4b.safetensors'
-
-    else:
-        error("Unknown model")
-        exit(1)
-
     # determine target data type
     target_dtype = parsed_args.dtype
     req_quantization, _, dtype_tag = DTYPE_PROPERTIES[target_dtype]
 
     # determine the high precision data type (default to FP32)
     if req_quantization:
+        mixed_small   = bool(parsed_args.mixed_small)
+        quality_tag   = "_small" if mixed_small else ""
         mixed_dtype   = parsed_args.mixed_dtype or 'FP32'
         mixed_tag     = f"_{mixed_dtype.lower()}mixed"
         qscales_dtype = parsed_args.qscales_dtype or 'FP32'
         qscales_tag   = f"_{qscales_dtype.lower()}qs" if qscales_dtype != 'FP32' else ""
     else:
+        quality_tag   = ""
         mixed_dtype   = None
         mixed_tag     = ""
         qscales_dtype = None
         qscales_tag   = ""
+        if parsed_args.mixed_small:
+            warning("--mixed-small is only supported for quantized models, it will be ignored")
         if parsed_args.mixed_dtype is not None:
             warning("--mixed-dtype is only supported for quantized models, it will be ignored")
         if parsed_args.qscales_dtype is not None:
@@ -1119,12 +1120,28 @@ def main(args=None, parent_script=None):
             sys.exit(1)
     clamping_tag = make_clamping_tag(clamp_limit, clamp_sharpness)
 
+    # validate model class
+    #  - diffusion model -> "z-image"
+    #  - text encoder    -> "qwen-3b"
+    if model == "z-image":
+        tensor_mapper = ZImageTensorMapper(aggressive_quantization=mixed_small)
+        default_name  = 'z_image_turbo.safetensors'
+
+    elif model == "qwen3-4b":
+        tensor_mapper = Qwen3TensorMapper()
+        default_name  = 'qwen3-4b.safetensors'
+
+    else:
+        error("Unknown model")
+        exit(1)
+
+
     # build path to the output safetensors file
     output_path  = Path(parsed_args.output or default_name)
     if not output_path.suffix:
         output_path = output_path.with_suffix(".safetensors")
 
-    new_filename = f"{output_path.stem}_{dtype_tag}{mixed_tag}{qscales_tag}{clamping_tag}{output_path.suffix}"
+    new_filename = f"{output_path.stem}_{dtype_tag}{mixed_tag}{qscales_tag}{quality_tag}{clamping_tag}{output_path.suffix}"
     output_path = output_path.with_name(new_filename)
 
 
@@ -1137,7 +1154,7 @@ def main(args=None, parent_script=None):
     message(f"Model            : {model.upper()}")
     message(f"Target Data Type : {target_dtype.upper()}")
     if isinstance(mixed_dtype,str):
-        message(f"Mixed Data Type  : {mixed_dtype.upper()}")
+        message(f"Mixed Data Type  : {mixed_dtype.upper()}{ ' (SMALL)' if mixed_small else '' }")
     if isinstance(qscales_dtype,str):
         message(f"QScales Data Type: {qscales_dtype.upper()}")
     message(f"Clamping Value   : {clamp_limit_str}")
