@@ -46,7 +46,7 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 import os
 import sys
 import argparse
-from typing import Any
+from typing import Any, TextIO
 from pathlib import Path
 if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv):
     # Modules that are not available in the standard library must be imported here
@@ -120,15 +120,21 @@ def error(msg: str, *info_messages: str, padding: int = 0, file=sys.stderr) -> N
 
 #================================= HELPERS =================================#
 
-def _fix_tensor_names(imatrix: dict, *, table: dict) -> dict:
+def _fix_tensor_names(imatrix: dict,
+                      *,
+                      tensor_name_map     : dict,
+                      rename_weight_suffix: bool = True) -> dict:
     """
     Renames GGUF tensor keys to Safetensors format using a provided conversion table.
 
     Args:
-        imatrix: Input dictionary where keys are GGUF tensor names
-                 and values are the corresponding tensor data.
-        table  : Dictionary containing a mapping of GGUF subkey to their
-                 equivalent Safetensors subkeys used for renaming.
+        imatrix              : Input dictionary where keys are GGUF tensor names
+                               and values are the corresponding tensor data.
+        tensor_name_map      : Dictionary containing a mapping of GGUF subkey to their
+                               equivalent Safetensors subkeys used for renaming.
+        rename_weight_suffix : Whether to convert '.weight' suffixes to '.scale_input'
+                               for compatibility with ComfyUI fp8 naming scheme.
+
     Returns:
         Dictionary with tensor keys renamed to Safetensors format, with the
         original tensor data preserved.
@@ -138,9 +144,14 @@ def _fix_tensor_names(imatrix: dict, *, table: dict) -> dict:
         # apply substring replacements by iterating over the conversion table
         # (a leading dot is temporarily added to ensure replacements work correctly)
         new_name = f".{tensor_name}"
-        for gguf_key, safetensor_key in table.items():
+        for gguf_key, safetensor_key in tensor_name_map.items():
             if gguf_key in new_name:
                 new_name = new_name.replace(gguf_key, safetensor_key)
+
+        # if weight suffix renaming is enabled, apply the conversion
+        if rename_weight_suffix and new_name.endswith('.weight'):
+            new_name = f"{new_name[:-7]}.scale_input"
+
         result[new_name.lstrip('.')] = data
 
     return result
@@ -242,29 +253,32 @@ def _load_legacy_imatrix(path: Path) -> dict[str, dict]:
     return result
 
 
+#============================= FP8 INPUT SCALE =============================#
 
 def _calculate_fp8_input_scale(sum_squared_activations: np.ndarray | list[float] | float,
                                total_samples          : int,
-                               sigma           : float = 3.7,
+                               *,
+                               sigma                  : float = 3.7,
                                dtype                  : str   = 'fp8_e4m3'
                                ) -> float:
     """
-    Calculate the input scale factor for FP8 (E4M3FN format) quantization
-    using an estimation of the activation matrix root mean square (RMS).
+    Calculate the optimal input scale factor for FP8 quantization.
 
-    This function estimates the maximum absolute value (amax) of the activation
-    distribution tail to select the appropriate scale that minimizes clipping
-    of outlier activation values during quantization.
+    This function estimates the input scale factor needed to quantize activations
+    into the target FP8 format. The input scale is inferred using an estimation
+    of the activation matrix root mean square (RMS).
 
     Args:
-        sum_squared_activations : Aggregated sum of squared activation values, typically computed per channel across all input samples.
-        total_samples           : Total number of samples used to compute the aggregated sum of squared activations.
-        sigma_factor            : Scaling factor applied to the representative global RMS to estimate the analytical amax
-                                  (cutoff point for the distribution tail). Defaults to 3.7.
-        dtype                   : Desired FP8 format, can be 'fp8_e4m3' or 'fp8_e5m2'. Defaults to 'fp8_e4m3'.
+        sum_squared_activations : Sum of squared activation values for a tensor.
+                                  Can be a single float, a list of floats, or a numpy array.
+        total_samples           : Total number of samples used to compute the sum of squares.
+        sigma                   : Scaling factor applied to the RMS to estimate the distribution
+                                  tail (amax). Defaults to 3.7.
+        dtype                   : The target FP8 format ('fp8_e4m3' or 'fp8_e5m2').
+                                  Defaults to 'fp8_e4m3'.
 
     Returns:
-        The final input scale factor to apply for FP8 quantization.
+        The computed input scale factor as a float.
     """
     sum_squares     = np.array(sum_squared_activations, dtype=np.float32)
     mean_of_squares = sum_squares / total_samples
@@ -281,9 +295,81 @@ def _calculate_fp8_input_scale(sum_squared_activations: np.ndarray | list[float]
     if not fp8_max:
         raise ValueError(f"Unsupported FP8 format: '{dtype}'. Use 'fp8_e4m3' or 'fp8_e5m2'.")
 
-    # compute the final multiplicative input scale
-    input_scale = estimated_amax / fp8_max
-    return input_scale
+    # compute the final input scale (compatible with ComfyUI ".scale_input")
+    inverse_input_scale = estimated_amax / fp8_max
+    return inverse_input_scale
+
+
+def _calculate_fp8_input_scales(imatrix : dict[str, dict],
+                                *,
+                                sigma   : float = 3.7,
+                                dtype   : str   = 'fp8_e4m3'
+                                ) -> dict[str, Any]:
+    """
+    calculate FP8 quantization scales for all tensors in the provided imatrix.
+
+    Iterates through the imatrix dictionary, which contains activation statistics
+    (sum of squares and sample counts), and calculates the optimal input scale
+    factor for each tensor to minimize quantization clipping.
+
+    Args:
+        imatrix : A dictionary where keys are tensor names and values are dicts
+                  containing "sum_squared_activations" and "total_samples".
+        sigma   : Scaling factor applied to the RMS to estimate the distribution
+                  tail (amax). Defaults to 3.7.
+        dtype   : The target FP8 format ('fp8_e4m3' or 'fp8_e5m2').
+                  Defaults to 'fp8_e4m3'.
+
+    Returns:
+        A dictionary containing the computed scale factor for each tensor,
+        along with metadata keys '__dtype__' and '__count__'.
+    """
+    results: dict[str, Any] = {
+        "__dtype__": dtype
+    }
+
+    count = 0
+    for tensor_name, data in imatrix.items():
+        sum_squared_activations = data.get("sum_squared_activations")
+        total_samples           = data.get("total_samples")
+
+        # calculate input scale factor per each valid tensor
+        if sum_squared_activations is not None and total_samples is not None:
+            scale = _calculate_fp8_input_scale(sum_squared_activations,
+                                               total_samples,
+                                               sigma = sigma,
+                                               dtype = dtype)
+            results[tensor_name] = scale
+            count += 1
+
+    results["__count__"] = count
+    return results
+
+
+def _write_input_scales(input_scales: dict[str, Any],
+                        file        : TextIO
+                        ) -> None:
+    """
+    Write the calculated FP8 input scales to a specified output stream.
+
+    Iterates through the input_scales dictionary and prints the scale factor
+    for each layer in a formatted table.
+
+    Args:
+        input_scales : A dictionary mapping layer names to their computed
+                       FP8 quantization scale factors, including metadata
+                       keys (e.g., '__dtype__', '__count__').
+        file         : A file-like object (e.g., sys.stdout or an open file)
+                       where the output will be written.
+
+    """
+    print(file=file)
+
+    for layer_name, input_scale in input_scales.items():
+        if layer_name.startswith('__'):
+            print(f"{layer_name}: {input_scale}", file=file)
+        else:
+            print(f"{layer_name:<40}: {input_scale}", file=file)
 
 
 
@@ -305,67 +391,63 @@ def main(args=None, parent_script=None):
     parser = argparse.ArgumentParser(
         prog        = prog,
         description = (
-            "Extract activation profiles from llama.cpp imatrix files and convert them\n"
-            "into static '.scale_input' tensors compatible with FP8-scaled network topologies.\n\n"
-            "This utility acts as a bridge between GGUF profiling data and FP8 execution backends."
+            "Extract activation profiles from llama.cpp imatrix files and convert them into\n"
+            "static '.scale_input' values compatible with ComfyUI FP8-scaled checkpoint format.\n\n"
+            "This utility acts as a bridge between GGUF profiling data and FP8 quantization scales."
         ),
         formatter_class = argparse.RawTextHelpFormatter,
     )
 
     #-- Input / Output Arguments ----------------
-    parser.add_argument('input_file', metavar='INPUT_IMATRIX', help="Path to the source 'imatrix.dat' calibration file.")
-    parser.add_argument('-o', '--output', help="Output file path for the generated scales (Default: same name as input with '.scales' extension)")
+    parser.add_argument('input_file', metavar='INPUT_IMATRIX',
+                        help="Path to the source 'imatrix.dat' calibration file.")
+    parser.add_argument('-o', '--output', type=str,
+                        help="Output file path for the generated scales. Use '-' to print to console\n"
+                             "Default: automatically saved as '<input>.input_scales.txt'.")
 
-    #-- Mathematical & Calibration Options ------
-    calib_group = parser.add_argument_group('mathematical & calibration options')
+    #-- Calibration Options ------
+    calib_group = parser.add_argument_group('calibration options')
     calib_group.add_argument('--sigma', type=float, default=3.3, metavar='FACTOR',
                              help=("Statistical multiplier (Sigma) to estimate the activation absmax from RMS values.\n"
                                    "3.3 roughly maps to the 99.9th percentile to isolate rare outliers. Default: 3.3."))
 
-    parsed_args = parser.parse_args(args=args)
+    args = parser.parse_args(args=args)
 
-    # Validate input file existence
-    input_path = Path(parsed_args.input_file)
+    # validate input file existence
+    input_path = Path(args.input_file)
     if not input_path.is_file():
         error(f"The input calibration file '{input_path}' does not exist.")
         sys.exit(1)
 
-    # Determine default names and enforce extension
-    default_name = "scales_fp8.safetensors"
-    output_path = Path(parsed_args.output or default_name)
-    if not output_path.suffix:
-        output_path = output_path.with_suffix(".safetensors")
-
-    # Log operational configuration details
-    message(f"Tool Name      : {prog.upper()}")
-    message(f"Source IMatrix : {input_path.name}")
-    message(f"Sigma Factor   : {parsed_args.sigma}")
-    message(f"Output File    : {output_path.name}")
-    message("----------------------------------------------------------------------")
-
     # PROCESS!!
     #try:
 
+    # load imatrix
     imatrix = _load_legacy_imatrix(input_path)
     if not imatrix:
         error("No valid tensor layers could be parsed from the provided imatrix file.")
         sys.exit(1)
 
-    imatrix = _fix_tensor_names(imatrix, table=QWEN3_GGUF_TO_SAFETENSORS)
+    # calculate input scales
+    imatrix      = _fix_tensor_names(imatrix, tensor_name_map=QWEN3_GGUF_TO_SAFETENSORS)
+    input_scales = _calculate_fp8_input_scales(imatrix, sigma = 7.4, dtype = 'fp8_e4m3')
 
-    print()
-    for layer_name, layer_data in imatrix.items():
-        sum_squared_activations = layer_data["sum_squared_activations"]
-        total_samples           = layer_data["total_samples"]
-        input_scale             = _calculate_fp8_input_scale(sum_squared_activations, total_samples, sigma=parsed_args.sigma)
-        print(f"{layer_name:<40}: { 2 * input_scale :.8f}")
+    # redirects output directly to console stdout without creating a file
+    if args.output == '-':
+        _write_input_scales(input_scales, file=sys.stdout)
+        sys.exit(0)
 
-    # output_np_path = output_path.with_suffix(".npy")
-    # tensor_payload = {
-    #     f"{layer}.scale_input": np.array([value], dtype=np.float32)
-    #     for layer, value in scales_dict.items()
-    # }
-    # np.save(str(output_np_path), tensor_payload)
+    # generate the output file name
+    dtype_tag = ""
+    sigma_tag = ""
+    new_filename = f"{input_path.stem}{dtype_tag}{sigma_tag}.input_scales.txt"
+    output_path  = input_path.with_name(new_filename)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        _write_input_scales(input_scales, file=f)
+        print(f"Input scales were written to {output_path}")
+
+
 
     # except Exception as e:
     #     error(f"An unexpected error occurred during processing pipeline: {str(e)}")
