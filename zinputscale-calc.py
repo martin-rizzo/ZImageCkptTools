@@ -44,6 +44,7 @@ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
  ```
 """
 import os
+import re
 import sys
 import argparse
 from typing import Any, TextIO
@@ -173,6 +174,37 @@ def float_to_tag(value: float | None) -> str:
         ''
     """
     return f"{int(round(value * 10)):02d}" if value is not None else ""
+
+
+def _sort_tensors(tensors: dict[str, Any]) -> tuple[list[tuple[str, Any]], list[tuple[str, Any]]]:
+    """
+    Splits tensors into metadata and actual tensor items, sorting tensor names by natural numerical order.
+
+    Args:
+        tensors: A dictionary mapping tensor names or metadata to their values.
+    Returns:
+        A tuple containing two lists of (key, value) pairs:
+          1. metadata_items: Items starting with '__' (unversioned/unsorted).
+          2. tensor_items  : Regular tensor items, sorted naturally by numerical index.
+    """
+    def natural_sort_key(item_tuple: tuple[str, Any]) -> list[Any]:
+        key_string = item_tuple[0]
+        return [int(text) if text.isdigit() else text.lower() for text in re.split(r'(\d+)', key_string)]
+
+    metadata_items: list[tuple[str, Any]] = []
+    layer_items   : list[tuple[str, Any]] = []
+
+    # separate items into metadata and tensor categories
+    for layer_name, value in tensors.items():
+        if layer_name.startswith('__'):
+            metadata_items.append((layer_name, value))
+        else:
+            layer_items.append((layer_name, value))
+
+    # sort tensor items using natural numerical key
+    layer_items.sort(key=natural_sort_key)
+    return metadata_items, layer_items
+
 
 
 #================================= IMATRIX =================================#
@@ -360,6 +392,7 @@ def _calculate_fp8_input_scales(imatrix : dict[str, dict],
             results[tensor_name] = scale
             count += 1
 
+    results["__sigma__"] = sigma
     results["__count__"] = count
     return results
 
@@ -383,11 +416,15 @@ def _write_input_scales(input_scales: dict[str, Any],
     """
     print(file=file)
 
-    for layer_name, input_scale in input_scales.items():
-        if layer_name.startswith('__'):
-            print(f"{layer_name}: {input_scale}", file=file)
-        else:
-            print(f"{layer_name:<40}: {input_scale}", file=file)
+    metadata_items, layer_items = _sort_tensors(input_scales)
+
+    for name, value in metadata_items:
+        print(f"{name}: {value}", file=file)
+
+    max_length = max([len(layer_name) for layer_name, _ in layer_items], default=1)
+    for layer_name, input_scale in layer_items:
+        print(f"{layer_name:<{max_length}} : {input_scale}", file=file)
+
 
 
 
