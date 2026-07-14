@@ -37,6 +37,7 @@ node_modules/
 
 # User-specific files and folders
 #
+*.input_scales.txt
 *~.*
 *~/
 
