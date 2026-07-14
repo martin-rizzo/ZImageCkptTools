@@ -56,9 +56,7 @@ if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv
     # Dictionary of maximum values for different FP8 formats
     FP8_MAX_VALUES = {
         "fp8_e4m3": float(ml_dtypes.finfo("float8_e4m3fn").max),
-        "e4m3"    : float(ml_dtypes.finfo("float8_e4m3fn").max),
         "fp8_e5m2": float(ml_dtypes.finfo("float8_e5m2").max),
-        "e5m2"    : float(ml_dtypes.finfo("float8_e5m2").max),
     }
 
     # Conversion table from GGUF tensor names to Safetensors tensor names.
@@ -155,6 +153,26 @@ def _fix_tensor_names(imatrix: dict,
         result[new_name.lstrip('.')] = data
 
     return result
+
+
+def float_to_tag(value: float | None) -> str:
+    """
+    Convert a float value into a compact tag string suitable for file naming conventions.
+
+    Args:
+        value : The float value to convert. If `None`, returns an empty string.
+    Returns:
+        A string representing the value, where '1.8' becomes '18' and '21.987' becomes '219'.
+        If the input is `None`, returns an empty string.
+    Examples:
+        >>> float_to_tag(21.1234)
+        '211'
+        >>> float_to_tag(0.5)
+        '05'
+        >>> float_to_tag(None)
+        ''
+    """
+    return f"{int(round(value * 10)):02d}" if value is not None else ""
 
 
 #================================= IMATRIX =================================#
@@ -381,8 +399,8 @@ def main(args=None, parent_script=None):
     """
     Main entry point for the imatrix2scale CLI tool.
     Args:
-        args          (optional): List of arguments to parse. Default is None.
-        parent_script (optional): The name of the calling script if any.
+        args          : List of arguments to parse. Default is None.
+        parent_script : The name of the calling script if any.
     """
     prog = "imatrix2scale"
     if parent_script:
@@ -411,7 +429,19 @@ def main(args=None, parent_script=None):
                              help=("Statistical multiplier (Sigma) to estimate the activation absmax from RMS values.\n"
                                    "3.3 roughly maps to the 99.9th percentile to isolate rare outliers. Default: 3.3."))
 
+    #-- FP8 Dtype Selection ------
+    fp8_group = calib_group.add_mutually_exclusive_group()
+    fp8_group.add_argument('--fp8-e4m3', action='store_const', const='fp8_e4m3', dest='dtype',
+                           help="Use FP8 E4M3 format (default).")
+    fp8_group.add_argument('--fp8-e5m2', action='store_const', const='fp8_e5m2', dest='dtype',
+                           help="Use FP8 E5M2 format.")
+    parser.set_defaults(dtype='fp8_e4m3')
+
     args = parser.parse_args(args=args)
+
+    # sigma  = 7.4
+    sigma = args.sigma
+    dtype = args.dtype
 
     # validate input file existence
     input_path = Path(args.input_file)
@@ -430,7 +460,7 @@ def main(args=None, parent_script=None):
 
     # calculate input scales
     imatrix      = _fix_tensor_names(imatrix, tensor_name_map=QWEN3_GGUF_TO_SAFETENSORS)
-    input_scales = _calculate_fp8_input_scales(imatrix, sigma = 7.4, dtype = 'fp8_e4m3')
+    input_scales = _calculate_fp8_input_scales(imatrix, sigma = sigma, dtype = dtype)
 
     # redirects output directly to console stdout without creating a file
     if args.output == '-':
@@ -438,8 +468,8 @@ def main(args=None, parent_script=None):
         sys.exit(0)
 
     # generate the output file name
-    dtype_tag = ""
-    sigma_tag = ""
+    dtype_tag = f"_{dtype}"
+    sigma_tag = f"_sigma{float_to_tag(sigma)}"
     new_filename = f"{input_path.stem}{dtype_tag}{sigma_tag}.input_scales.txt"
     output_path  = input_path.with_name(new_filename)
 
