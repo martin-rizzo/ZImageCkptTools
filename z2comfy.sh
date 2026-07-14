@@ -177,17 +177,19 @@ if [[ "$SHOW_HELP" == true ]]; then
     exit 0
 fi
 
-# handle the extra options for removing the venv
-if [[ "$REMOVE_VENV" == true ]]; then
-    remove_venv
-    exit 0
-fi
-
-# handle the extra options for creating the venv
-if [[ "$CREATE_VENV" == true ]]; then
-    create_venv
-    activate_venv
-    install_dependencies "$REQUIREMENTS_FILE"
+# if either create or remove options are requested, execute and exit
+if [[ "$CREATE_VENV" == true || "$REMOVE_VENV" == true ]]
+then
+    # handle the option for removing the venv
+    if [[ "$REMOVE_VENV" == true ]]; then
+        remove_venv
+    fi
+    # handle the option for creating the venv
+    if [[ "$CREATE_VENV" == true ]]; then
+        create_venv
+        activate_venv
+        install_dependencies "$REQUIREMENTS_FILE"
+    fi
     exit 0
 fi
 
