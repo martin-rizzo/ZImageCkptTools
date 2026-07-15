@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# File    : zinputscale-make.sh
-# Purpose : Wrapper for `zinputscale-make.py` that handles the python virtual environment
+# File    : zfp8scales-calc.sh
+# Purpose : Wrapper for `zfp8scales-calc.py` that handles the python virtual environment
 # Author  : Martin Rizzo | <martinrizzo@gmail.com>
 # Date    : Jul 12, 2026
 # Repo    : https://github.com/martin-rizzo/ComfyUI-ZImagePowerNodes

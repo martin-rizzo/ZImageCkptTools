@@ -7,8 +7,8 @@ These tools were initially created to convert the original checkpoints provided 
 ## Tools
 
 - `z2comfy.py`: Converts Z-Image checkpoint files into various formats compatible with ComfyUI.
+- `zfp8scales-calc.py`: Calculates '.scale_input' values compatible with ComfyUI from activation profiles in llama.cpp imatrix files.
 - `zfp8scales-extract.py`: Extracts '.scale_input' tensors from a float8 quantized safetensors checkpoint.
-- `zfp8scales-make.py`: Calculates '.scale_input' values compatible with ComfyUI from activation profiles in llama.cpp imatrix files.
 
 ### Prerequisites
 - Python 3.11 or higher

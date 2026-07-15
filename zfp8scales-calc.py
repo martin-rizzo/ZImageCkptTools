@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-File    : zinputscale-calc.py
+File    : zfp8scales-calc.py
 Purpose : Calculate the optimal ".scale_input" factor for ComfyUI-compatible
           float8 scaled quantization, extracting information from imatrix files
 Author  : Martin Rizzo | <martinrizzo@gmail.com>
