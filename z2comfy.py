@@ -22,8 +22,10 @@ from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final, IO, cast
+SCRIPT_NAME = Path(__file__).stem
 if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv):
-    # modules that are not available in the standard library are imported here
+
+    # Modules that are not available in the standard library must be imported here
     import numpy as np
     import numpy.typing as npt
     import ml_dtypes
@@ -1009,19 +1011,17 @@ def validate_and_collect_safetensors(input_files: list[str | Path]) -> list[Path
     return valid_files
 
 
-def main(args=None, parent_script=None):
+def main(parent_args  : list[str] | None = None,
+         parent_script: str | None       = None
+         ) -> None:
     """
-    Main entry point for the script.
+    Main entry point for the CLI tool.
     Args:
-        args          (optional): List of arguments to parse. Default is None, which will use the command line arguments.
-        parent_script (optional): The name of the calling script if any. Used for customizing help output.
+        parent_args   : List of arguments to parse or `None` for reading from command line.
+        parent_script : The name of the calling script if any.
     """
-    prog = None
-    if parent_script:
-        prog = f"{parent_script} {os.path.splitext(os.path.basename(__file__))[0]}"
-
     parser = argparse.ArgumentParser(
-        prog        = prog,
+        prog        = f"{parent_script} {SCRIPT_NAME}" if parent_script else SCRIPT_NAME,
         description = (
             "Convert Z-Image checkpoint files into various formats compatible with ComfyUI.\n\n"
             "This utility supports multiple precision formats (FP32, FP16, BF16), integer "
@@ -1078,24 +1078,24 @@ def main(args=None, parent_script=None):
                                 help=("This value is used with types involving stochastic rounding, such as --fp16e or --bf16e.\n"
                                       "Setting a fixed seed ensures reproducible results. Default: 100."))
 
-    parsed_args = parser.parse_args(args=args)
+    args = parser.parse_args(parent_args)
 
     # check input files and determine model class
-    input_files      = validate_and_collect_safetensors(parsed_args.input_files)
+    input_files      = validate_and_collect_safetensors(args.input_files)
     input_file_count = len(input_files)
     model = detect_model_architecture(input_files)
 
     # determine target data type
-    target_dtype = parsed_args.dtype
+    target_dtype = args.dtype
     req_quantization, _, dtype_tag = DTYPE_PROPERTIES[target_dtype]
 
     # determine the high precision data type (default to FP32)
     if req_quantization:
-        mixed_small   = bool(parsed_args.mixed_small)
+        mixed_small   = bool(args.mixed_small)
         quality_tag   = "_small" if mixed_small else ""
-        mixed_dtype   = parsed_args.mixed_dtype or 'FP32'
+        mixed_dtype   = args.mixed_dtype or 'FP32'
         mixed_tag     = f"_{mixed_dtype.lower()}mixed"
-        qscales_dtype = parsed_args.qscales_dtype or 'FP32'
+        qscales_dtype = args.qscales_dtype or 'FP32'
         qscales_tag   = f"_{qscales_dtype.lower()}qs" if qscales_dtype != 'FP32' else ""
     else:
         quality_tag   = ""
@@ -1103,18 +1103,18 @@ def main(args=None, parent_script=None):
         mixed_tag     = ""
         qscales_dtype = None
         qscales_tag   = ""
-        if parsed_args.mixed_small:
+        if args.mixed_small:
             warning("--mixed-small is only supported for quantized models, it will be ignored")
-        if parsed_args.mixed_dtype is not None:
+        if args.mixed_dtype is not None:
             warning("--mixed-dtype is only supported for quantized models, it will be ignored")
-        if parsed_args.qscales_dtype is not None:
+        if args.qscales_dtype is not None:
             warning("--qscales-dtype is only supported for quantized models, it will be ignored")
 
 
     # determine the clamp parameters (if any)
     clamp_limit, clamp_sharpness = None, None
-    if parsed_args.clamp:
-        clamp_limit, clamp_sharpness = parse_clamp_args(parsed_args.clamp)
+    if args.clamp:
+        clamp_limit, clamp_sharpness = parse_clamp_args(args.clamp)
         if clamp_limit is None or clamp_sharpness is None:
             error("Invalid --clamp argument format. Expected format: 'limit:sharpness'")
             sys.exit(1)
@@ -1137,7 +1137,7 @@ def main(args=None, parent_script=None):
 
 
     # build path to the output safetensors file
-    output_path  = Path(parsed_args.output or default_name)
+    output_path  = Path(args.output or default_name)
     if not output_path.suffix:
         output_path = output_path.with_suffix(".safetensors")
 
@@ -1146,7 +1146,7 @@ def main(args=None, parent_script=None):
 
 
     # create the RNG for stochastic rounding
-    stochastic_generator = np.random.default_rng(parsed_args.seed)
+    stochastic_generator = np.random.default_rng(args.seed)
 
 
     # print configuration details
@@ -1158,12 +1158,12 @@ def main(args=None, parent_script=None):
     if isinstance(qscales_dtype,str):
         message(f"QScales Data Type: {qscales_dtype.upper()}")
     message(f"Clamping Value   : {clamp_limit_str}")
-    message(f"Stochastic Seed  : {parsed_args.seed}")
+    message(f"Stochastic Seed  : {args.seed}")
     message(f"Input            : {input_file_count} safetenstensors {'file' if input_file_count == 1 else 'files'}")
     message(f"Output File      : {output_path.name}")
 
     # prepare the temporary file for in-memory or disk based on --low-ram argument
-    if parsed_args.low_ram:
+    if args.low_ram:
         message("Using disk-based temporary file for low RAM mode.")
         tmp_context = tempfile.TemporaryFile(dir=output_path.parent)
     else:
@@ -1172,16 +1172,16 @@ def main(args=None, parent_script=None):
 
     # generate the initial info of the safetensors header
     safetensors_header = create_safetensors_header(
-        title       = parsed_args.title       or "Z-Image/Z-Image-Turbo",
-        author      = parsed_args.author      or "Alibaba Tongyi Lab",
-        license     = parsed_args.license     or "Apache-2.0",
-        description = parsed_args.description or (
+        title       = args.title       or "Z-Image/Z-Image-Turbo",
+        author      = args.author      or "Alibaba Tongyi Lab",
+        license     = args.license     or "Apache-2.0",
+        description = args.description or (
             "Z-Image is a 6B parameter image generation model based on a "
             "Scalable Single-Stream DiT (S3-DiT) architecture. Optimized to "
             "generate high-quality images, it stands out for its excellent "
             "bilingual (English and Chinese) text rendering capabilities."
         ),
-        thumbnail_path = parsed_args.thumbnail,
+        thumbnail_path = args.thumbnail,
         architecture   = "z-image-v1",
         tags           = "Image Generation, S3-DiT, Bilingual, English, Chinese",
         resolution     = "1024x1024",
@@ -1205,7 +1205,7 @@ def main(args=None, parent_script=None):
                                         tensor_mapper        = tensor_mapper,
                                         progress             = progress_bar)
 
-        if parsed_args.sort_tensors:
+        if args.sort_tensors:
             message("Sorting tensors by size...")
             output_header = sort_safetensors_header(safetensors_header)
         else:

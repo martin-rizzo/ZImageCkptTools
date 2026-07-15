@@ -49,7 +49,9 @@ import sys
 import argparse
 from typing import Any, TextIO
 from pathlib import Path
+SCRIPT_NAME = Path(__file__).stem
 if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv):
+
     # Modules that are not available in the standard library must be imported here
     import numpy as np
     import ml_dtypes
@@ -432,19 +434,17 @@ def _write_input_scales(input_scales: dict[str, Any],
 #////////////////////////////////// MAIN ///////////////////////////////////#
 #===========================================================================#
 
-def main(args=None, parent_script=None):
+def main(parent_args  : list[str] | None = None,
+         parent_script: str | None       = None
+         ) -> None:
     """
-    Main entry point for the imatrix2scale CLI tool.
+    Main entry point for the CLI tool.
     Args:
-        args          : List of arguments to parse. Default is None.
+        parent_args   : List of arguments to parse or `None` for reading from command line.
         parent_script : The name of the calling script if any.
     """
-    prog = "imatrix2scale"
-    if parent_script:
-        prog = f"{parent_script} {os.path.splitext(os.path.basename(__file__))[0]}"
-
     parser = argparse.ArgumentParser(
-        prog        = prog,
+        prog        = f"{parent_script} {SCRIPT_NAME}" if parent_script else SCRIPT_NAME,
         description = (
             "Extract activation profiles from llama.cpp imatrix files and convert them into\n"
             "static '.scale_input' values compatible with ComfyUI FP8-scaled checkpoint format.\n\n"
@@ -474,7 +474,7 @@ def main(args=None, parent_script=None):
                            help="Use FP8 E5M2 format.")
     parser.set_defaults(dtype='fp8_e4m3')
 
-    args = parser.parse_args(args=args)
+    args = parser.parse_args(parent_args)
 
     # sigma  = 7.4
     sigma = args.sigma
