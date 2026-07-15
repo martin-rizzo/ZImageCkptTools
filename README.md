@@ -1,4 +1,4 @@
-# ZModelTools
+# ZImageCkptTools
 
 A set of command-line tools written in Python for managing, quantizing, and verifying Z-Image and Z-Image Turbo checkpoints.
 
