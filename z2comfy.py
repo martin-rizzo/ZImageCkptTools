@@ -93,12 +93,41 @@ if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv
         "INT4CONVROT"   :TargetFormatInfo(True     , True   , "int4_convrot" , np.dtype(ml_dtypes.int4)          ),
     }
 
+    # Checkpoint metadata for Z-Image models
+    ZIMAGE_METADATA = {
+        "title"       : "Z-Image/Z-Image-Turbo",
+        "author"      : "Alibaba Tongyi Lab",
+        "license"     : "Apache-2.0",
+        "description" : (
+            "Z-Image is a 6B parameter image generation model based on a "
+            "Scalable Single-Stream DiT (S3-DiT) architecture. Optimized to "
+            "generate high-quality images, it stands out for its excellent "
+            "bilingual (English and Chinese) text rendering capabilities."
+        ),
+        "architecture": "z-image-v1",
+        "tags"        : "Image Generation, S3-DiT, Bilingual, English, Chinese",
+        "resolution"  : "1024x1024",
+    }
+
+    # Checkpoint metadata for Qwen3 models
+    QWEN3_4B_METADATA = {
+        "title"       : "Qwen3-4B (Instruct)",
+        "author"      : "Alibaba Cloud Qwen Team",
+        "license"     : "Apache-2.0",
+        "description" : (
+            "Qwen3-4B is a 4.0 billion parameter dense large language model "
+            "incorporating advanced dual-mode reasoning capabilities. It features "
+            "hybrid thinking modes to dynamically switch between high-precision "
+            "logical reasoning and efficient dialogue generation across 119 languages."
+        ),
+        "architecture": "qwen3",
+        "tags"        : "LLM, Text Generation, Multilingual, GQA",
+        "resolution"  : None,
+    }
+
 # Safetensors Header Structure
 # each tensor name maps to a dictionary containing its metadata
 type SafetensorsHeader = dict[str, dict[str, Any]]
-
-# get the directory where the script is located
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ConvRot configuration
 # Must be a power of 4 for Regular Hadamard (e.g. 16, 64, 256)
@@ -1223,12 +1252,14 @@ def main(parent_args  : list[str] | None = None,
     #  - diffusion model -> "z-image"
     #  - text encoder    -> "qwen-3b"
     if model == "z-image":
-        tensor_mapper = ZImageTensorMapper(aggressive_quantization=mixed_small)
-        default_name  = 'z_image_turbo.safetensors'
+        tensor_mapper       = ZImageTensorMapper(aggressive_quantization=mixed_small)
+        default_name        = 'z_image_turbo.safetensors'
+        checkpoint_metadata = ZIMAGE_METADATA
 
     elif model == "qwen3-4b":
-        tensor_mapper = Qwen3TensorMapper()
-        default_name  = 'qwen3-4b.safetensors'
+        tensor_mapper       = Qwen3TensorMapper()
+        default_name        = 'qwen3-4b.safetensors'
+        checkpoint_metadata = QWEN3_4B_METADATA
 
     else:
         error("Unknown model")
@@ -1271,19 +1302,14 @@ def main(parent_args  : list[str] | None = None,
 
     # generate the initial info of the safetensors header
     safetensors_header = create_safetensors_header(
-        title       = args.title       or "Z-Image/Z-Image-Turbo",
-        author      = args.author      or "Alibaba Tongyi Lab",
-        license     = args.license     or "Apache-2.0",
-        description = args.description or (
-            "Z-Image is a 6B parameter image generation model based on a "
-            "Scalable Single-Stream DiT (S3-DiT) architecture. Optimized to "
-            "generate high-quality images, it stands out for its excellent "
-            "bilingual (English and Chinese) text rendering capabilities."
-        ),
+        title       = args.title       or checkpoint_metadata["title"],
+        author      = args.author      or checkpoint_metadata["author"],
+        license     = args.license     or checkpoint_metadata["license"],
+        description = args.description or checkpoint_metadata["description"],
         thumbnail_path = args.thumbnail,
-        architecture   = "z-image-v1",
-        tags           = "Image Generation, S3-DiT, Bilingual, English, Chinese",
-        resolution     = "1024x1024",
+        architecture   = checkpoint_metadata["architecture"],
+        tags           = checkpoint_metadata["tags"],
+        resolution     = checkpoint_metadata["resolution"],
         date           = "*")
 
 
