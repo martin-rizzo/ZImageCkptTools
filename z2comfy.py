@@ -541,10 +541,63 @@ def quantize_fp8_scaled(tensor: np.ndarray,
     return quantized_fp8, scale_inv
 
 
-def read_scale_input(tensor_name: str, *, format: PrecisionFormat) -> np.ndarray:
-    """Read the `.scale_input` value from a table created from an external file"""
+def preload_fp8_scales(path: Path) -> dict[str, str]:
+    """Parses a fp8scales file into a dictionary.
+    Args:
+        path : A `Path` object pointing to the scale configuration file.
+    Returns:
+        A dictionary where keys represent tensor names and values represent
+        their corresponding scale factors.
+    """
+    scales = {}
+    with path.open('r', encoding='utf-8') as file:
+
+        for line_num, line in enumerate(file, start=1):
+            clean_line = line.strip()
+
+            # skip empty lines and comments starting with '#'
+            # and validate line format
+            if not clean_line or clean_line.startswith('#'):
+                continue
+            if not ':' in clean_line:
+                raise ValueError(f"Invalid line format in line {line_num}")
+
+            key, _, value = clean_line.partition(':')
+            scales[key.strip()] = value.strip()
+
+    return scales
+
+
+def read_fp8_preloaded_scale(tensor_name: str,
+                             fp8_preloaded_scales : dict[str,str] | None,
+                             *,
+                             format: PrecisionFormat
+                             ) -> np.ndarray:
+    """Get the `.scale_input` value for a specific tensor.
+    Args:
+        tensor_name         : The identifier of the tensor for which to retrieve the scale.
+        fp8_preloaded_scales: A preloaded dictionary containing the mapping of tensor names to scale values.
+        format              : The target precision format for the scaling value.
+    Returns:
+        A NumPy array containing the scale factor as a float, cast to the dtype
+        required by the precision format.
+    """
     _, _, _, dtype = TARGET_FORMAT_INFO[format]
-    return np.array([1.0], dtype=dtype)
+    scale_float = 1.0
+
+    if fp8_preloaded_scales:
+        value = fp8_preloaded_scales.get(tensor_name)
+        if value is None:
+            warning(f"Missing scale for {tensor_name}. Defaulting to 1.0")
+        else:
+            try:
+                scale_float = float(value)
+            except:
+                warning(f"Could not convert scale value '{value}' for {tensor_name} to float. Defaulting to 1.0")
+                scale_float = 1.0
+
+    return np.array([scale_float], dtype=dtype)
+
 
 
 #========================= INT CONVROT QUANTIZATION =========================#
@@ -687,7 +740,11 @@ def quantize_int8_rowwise(tensor: np.ndarray, *,
     if scales_format.upper() in ("FP16", "BF16", "FP16E", "BF16E"):
         # these 3 steps are required because cast_tensor returns a dict instead of the raw tensor
         TENSOR_NAME = "scales"
-        tensor_dict = cast_tensor(TENSOR_NAME, scales, cast_to=scales_format, scales_format=scales_format, stochastic_generator=stochastic_generator)
+        tensor_dict = cast_tensor(TENSOR_NAME, scales,
+                                  cast_to              = scales_format,
+                                  scales_format        = scales_format,
+                                  fp8_preloaded_scales = None,
+                                  stochastic_generator = stochastic_generator)
         scales      = tensor_dict[TENSOR_NAME]
 
     return quantized_int8, scales
@@ -828,7 +885,9 @@ def cast_tensor(tensor_name: str,
                 *,
                 cast_to             : str,
                 scales_format       : PrecisionFormat,
-                stochastic_generator: np.random.Generator) -> dict:
+                fp8_preloaded_scales: dict[str,str] | None,
+                stochastic_generator: np.random.Generator,
+                ) -> dict:
     """
     Cast a tensor to a target dtype, optionally using stochastic rounding.
 
@@ -883,7 +942,7 @@ def cast_tensor(tensor_name: str,
     elif cast_to == "FP8SCALED":
         input_scales_format   = scales_format
         quantized_fp8, scales = quantize_fp8_scaled(tensor, target_format="FP8SCALED", scales_format=scales_format, stochastic_generator=stochastic_generator)
-        scale_input           = read_scale_input(tensor_name, format=input_scales_format)
+        scale_input           = read_fp8_preloaded_scale(f"{parent}.scale_input", fp8_preloaded_scales, format=input_scales_format)
         return {
             f"{parent}.weight"      : quantized_fp8,
             f"{parent}.scale_weight": scales,
@@ -912,6 +971,7 @@ def convert_safetensors_file(input_safetensors_file: Path,
                              target_format        : TargetFormat,
                              scales_format        : PrecisionFormat | None     = None,
                              high_precision_format: PrecisionFormat | None     = None,
+                             fp8_preloaded_scales : dict[str,str] | None       = None,
                              stochastic_generator : np.random.Generator | None = None,
                              tensor_mapper        : Callable | None            = None,
                              clamp_limit          : float | None               = None,
@@ -997,7 +1057,11 @@ def convert_safetensors_file(input_safetensors_file: Path,
 
             # cast tensor to the desired dtype,
             # the result is a dictionary because some casting processes generate multiple tensors for ComfyUI
-            out_tensor_dict = cast_tensor(tensor_name, tensor, cast_to=cast_to, scales_format=scales_format, stochastic_generator=stochastic_generator)
+            out_tensor_dict = cast_tensor(tensor_name, tensor,
+                                          cast_to              = cast_to,
+                                          scales_format        = scales_format,
+                                          fp8_preloaded_scales = fp8_preloaded_scales,
+                                          stochastic_generator = stochastic_generator)
 
             # convert casted tensor to bytes and store them in `output_rawtensor_file`
             for out_tensor_name, out_tensor in out_tensor_dict.items():
@@ -1186,7 +1250,9 @@ def main(parent_args  : list[str] | None = None,
     precision_main_group.add_argument('--mixed-dtype', type=lambda s: s.upper(), choices=['FP32', 'FP16', 'BF16', 'FP16E', 'BF16E'], metavar='TYPE',
                                       help="High precision data type used alongside quantized formats. Default: FP32.")
     precision_main_group.add_argument('--mixed-small', action='store_true',
-                                    help="Quantize aggressively for faster speeds at the cost of some quality.")
+                                      help="Quantize aggressively for faster speeds at the cost of some quality.")
+    precision_main_group.add_argument('--iscales', type=Path, metavar='FILE',
+                                      help="Path to a file containing precalculated input scales (only valid with --fp8scaled).")
 
 
     #-- Metadata options group ------------------
@@ -1208,6 +1274,10 @@ def main(parent_args  : list[str] | None = None,
 
     args = parser.parse_args(parent_args)
 
+    # verify '--iscales' is provided only when '--fp8scaled' is selected
+    if args.iscales and args.dtype != 'FP8SCALED':
+        parser.error("The --iscales argument can only be used when '--fp8scaled' is selected as the quantization option.")
+
     # check input files and determine model class
     input_files      = validate_and_collect_safetensors(args.input_files)
     input_file_count = len(input_files)
@@ -1216,6 +1286,19 @@ def main(parent_args  : list[str] | None = None,
     # determine target data type
     target_format = cast(TargetFormat, args.dtype)
     req_quantization, _, dtype_tag, _ = TARGET_FORMAT_INFO[target_format]
+
+    # load the "iscales" file if required by the user
+    iscales, iscales_tag = None, ""
+    if args.iscales:
+        if not args.iscales.is_file():
+            parser.error(f"The input scales file does not exist or is not a valid file: {args.iscales}")
+        try:
+            iscales     = preload_fp8_scales(args.iscales)
+            iscales_tag = "_iscales"
+        except Exception as e:
+            parser.error(f"Failed to load the input scales file '{args.iscales}': {e}")
+            iscales, iscales_tag = None, ""
+
 
     # determine the high precision data type (default to FP32)
     if req_quantization:
@@ -1271,7 +1354,7 @@ def main(parent_args  : list[str] | None = None,
     if not output_path.suffix:
         output_path = output_path.with_suffix(".safetensors")
 
-    new_filename = f"{output_path.stem}_{dtype_tag}{mixed_tag}{scales_tag}{quality_tag}{clamping_tag}{output_path.suffix}"
+    new_filename = f"{output_path.stem}_{dtype_tag}{mixed_tag}{scales_tag}{quality_tag}{iscales_tag}{clamping_tag}{output_path.suffix}"
     output_path = output_path.with_name(new_filename)
 
 
@@ -1324,6 +1407,7 @@ def main(parent_args  : list[str] | None = None,
                                         target_format         = target_format,
                                         scales_format         = scales_format,
                                         high_precision_format = mixed_format,
+                                        fp8_preloaded_scales  = iscales,
                                         stochastic_generator  = stochastic_generator,
                                         clamp_limit           = clamp_limit,
                                         clamp_sharpness       = clamp_sharpness,
