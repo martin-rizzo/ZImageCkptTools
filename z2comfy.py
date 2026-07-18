@@ -10,6 +10,7 @@ License : MIT
           CLI tools for manipulating and verifying Z-Image checkpoints.
 _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
 """
+import gc
 import io
 import os
 import sys
@@ -26,9 +27,10 @@ SCRIPT_NAME = Path(__file__).stem
 if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv):
 
     # Modules that are not available in the standard library must be imported here
+    import ml_dtypes
     import numpy as np
     import numpy.typing as npt
-    import ml_dtypes
+    from numpy.typing import NDArray
     from typing      import Callable, Any
     from safetensors import safe_open as safetensors_open
 
@@ -111,7 +113,7 @@ if __name__ == '__main__' and ("-h" not in sys.argv and "--help" not in sys.argv
 
     # Checkpoint metadata for Qwen3 models
     QWEN3_4B_METADATA = {
-        "title"       : "Qwen3-4B (Instruct)",
+        "title"       : "Qwen3-4B",
         "author"      : "Alibaba Cloud Qwen Team",
         "license"     : "Apache-2.0",
         "description" : (
@@ -349,6 +351,22 @@ def detect_model_architecture(input_files: list[Path]) -> str:
     if found_z_suffixes    == Z_IMAGE_SUFFIXES: return "z-image"
     if found_qwen_suffixes == QWEN_SUFFIXES   : return "qwen3-4b"
     return "unknown"
+
+
+def build_metadata_tensor(**metadata: Any) -> np.ndarray:
+    """Construct a UINT8 numpy tensor containing serialized metadata for ComfyUI.
+
+    This function acts as a factory, taking arbitrary keyword arguments,
+    serializing them into JSON, and returning them as a byte-based tensor
+    suitable for storage in ComfyUI or similar frameworks.
+    Args:
+        **metadata : Arbitrary keyword arguments that will be serialized
+                     into the resulting tensor.
+    Returns:
+        A 1D numpy array of type uint8 containing the encoded metadata.
+    """
+    byte_data = json.dumps(metadata).encode("utf-8")
+    return np.frombuffer(byte_data, dtype=np.uint8)
 
 
 #============================== PROGRESS BAR ===============================#
@@ -602,37 +620,164 @@ def read_fp8_preloaded_scale(tensor_name: str,
 
 #========================= INT CONVROT QUANTIZATION =========================#
 
-@lru_cache(maxsize=8)
-def build_hadamard(size: int, dtype: npt.DTypeLike | None = None) -> np.ndarray:
-    """Build a normalized REGULAR orthogonal Hadamard matrix using NumPy."""
-    if size < 4 or (size & (size - 1)) != 0 or (size.bit_length() - 1) % 2 != 0:
-        raise ValueError(f"Regular Hadamard size must be a power of 4, got {size}")
-    if dtype is None:
-        dtype = np.float32
+def quantize_int8_convrot(tensor: np.ndarray,
+                          *,
+                          group_size           : int,
+                          scales_format        : PrecisionFormat,
+                          scales_search_trials : int,
+                          stochastic_generator : np.random.Generator,
+                          ) -> tuple[np.ndarray, np.ndarray]:
+    """Perform a ConvRot tensor rotation followed by row-wise INT8 quantization.
+    Args:
+        tensor              : The input tensor to be quantized.
+        group_size          : Size of the group for rotation.
+        scales_format       : String representing the target dtype for the scales. Supported
+                              values are "FP32", "FP16", "BF16", "FP16E", and  "BF16E".
+                              Any other value will be treated as FP32.
+        scale_search_trials : Number of candidate scale factors to test during optimization
+                              to minimize quantization error (MSE).
+        stochastic_generator: The `np.random.Generator` used when stochastic rounding is needed.
+    Returns:
+        A tuple containing:
+            - quantized_int8: An INT8 array resulting from the rotation and quantization process.
+            - scales        : Array containing per-row scales with shape [..., 1], casted
+                              to the specified `scales_format`.
+    """
+    hadamard_matrix = _build_hadamard_matrix(group_size, dtype="float32")
+    rotated_tensor  = _rotate_tensor(tensor, hadamard_matrix, group_size)
+    return _quantize_int8_rowwise(rotated_tensor,
+                                  scales_format        = scales_format,
+                                  scales_search_trials = scales_search_trials,
+                                  stochastic_generator = stochastic_generator)
 
-    # base H4 from Theorem 3.3 (Eq 9 in the paper)
-    # notice how every row and column sums to exactly 2
-    H4 = np.array([
-        [ 1,  1,  1, -1],
-        [ 1,  1, -1,  1],
-        [ 1, -1,  1,  1],
-        [-1,  1,  1,  1]
-    ], dtype=dtype)
 
-    # Kronecker product construction
-    H, current_size = H4, 4
-    while current_size < size:
-        H = np.kron(H, H4)
-        current_size *= 4
+def _quantize_int8_rowwise(tensor: np.ndarray,
+                           *,
+                           scales_format        : PrecisionFormat,
+                           scales_search_trials : int,
+                           stochastic_generator : np.random.Generator,
+                          ) -> tuple[np.ndarray, np.ndarray]:
+    """Quantize a tensor to INT8 with per-row scales, supporting custom scale dtypes.
 
-    # normalize to make it orthogonal
-    return H / np.sqrt(size)
+    Args:
+        tensor              : Input array of shape [..., K] where quantization will be performed.
+        scales_format       : String representing the target dtype for the scales. Supported
+                              values are "FP32", "FP16", "BF16", "FP16E", and  "BF16E".
+                              Any other value will be treated as FP32.
+        scale_search_trials : Number of candidate scale factors to test during optimization
+                              to minimize quantization error (MSE).
+        stochastic_generator: The `np.random.Generator` used when stochastic rounding is needed.
+
+    Returns:
+        A tuple containing:
+            - quantized_int8: An INT8 array with the same shape as the input tensor.
+            - scales        : Array containing per-row scales with shape [..., 1], casted
+                              to the specified `scales_format`.
+    """
+    if tensor.dtype != np.float32:
+        tensor = tensor.astype(np.float32)
+
+    scales_dtype = TARGET_FORMAT_INFO[scales_format].dtype
+
+    # calculate scales using the absolute maximum value of each ???
+    abs_maximum = np.max(np.abs(tensor), axis=-1, keepdims=True)
+    scales = np.maximum(abs_maximum / 127.0, FP32_EPSILON)
+
+    # optimize scales when requested by the user
+    if scales_search_trials > 1:
+        quantized_int8, scales = optimize_quantization_scales(tensor, scales,
+                                        scales_dtype = scales_dtype,
+                                        quant_dtype  = np.dtype(np.int8),
+                                        quant_min    = np.iinfo(np.int8).min,
+                                        quant_max    = np.iinfo(np.int8).max,
+                                        quant_is_int = True,
+                                        num_trials   = scales_search_trials)
+    else:
+        # if not trial allowed, use naive quantization
+        quantized_int8 = (tensor / scales).astype(np.int8)
+        scales         = scales.astype(scales_dtype)
+
+    return quantized_int8, scales
 
 
-def rotate_tensor(tensor      : np.ndarray,
-                  h_matrix    : np.ndarray,
-                  group_size  : int,
-                  ) -> np.ndarray:
+def optimize_quantization_scales(tensor: NDArray[np.float32],
+                                 scales: NDArray[np.float32],
+                                 *,
+                                 scales_dtype: np.dtype[Any],
+                                 quant_dtype : np.dtype[Any],
+                                 quant_min   : float | int,
+                                 quant_max   : float | int,
+                                 quant_is_int: bool,
+                                 num_trials: int = 30) -> tuple[NDArray, NDArray]:
+    """
+    Find optimal quantization scales for a given tensor by testing multiple scaling factors.
+
+    Args:
+        tensor       : Input tensor of shape [R, C] to be quantized.
+        scales       : Initial scale factors per row, shape [R, 1].
+        scales_dtype : The data type used for the resulting scales.
+        quant_dtype  : The data type used for the quantized tensor.
+        quant_min    : The minimum value for the quantized range.
+        quant_max    : The maximum value for the quantized range.
+        quant_is_int : `True` if the quantization is integer, `False` if floating point.
+        num_trials   : Number of scale variations to test.
+
+    Returns:
+        A tuple containing the quantized tensor and the optimized scales.
+    """
+    # tensor: [R, C] -> R: Rows, C: Columns
+    # scales: [R, 1] -> An initial scale per row
+
+    # define scale options [T, R, 1] where T = num_trials
+    steps = np.linspace(0.96, 1.005, num=num_trials, dtype=np.float32)
+    scales_options = steps[:, np.newaxis, np.newaxis] * scales[np.newaxis, :, :]
+    scales_options = scales_options.astype(scales_dtype).astype(np.float32)
+
+    # expand the original tensor for calculation -> [1, R, C]
+    tensor_orig = tensor[np.newaxis, :, :]
+
+    # quantize using ALL possible scales
+    raw_quant = tensor_orig / scales_options
+    if quant_is_int:
+        raw_quant = np.round(raw_quant)
+    raw_quant = np.clip(raw_quant, quant_min, quant_max).astype(quant_dtype)
+
+    # dequantize back to float32,
+    # approximating the original tensor with its quantization error
+    tensor_approx = raw_quant.astype(np.float32) * scales_options
+
+    # destroy scales_options right now to free memory
+    del scales_options
+    gc.collect()
+
+    # calculate the error (MSE) for each scale option and row: [T, R]
+    error_per_row = np.mean((tensor_orig - tensor_approx) ** 2, axis=2)
+
+    # select the best scale per row (index of the minimum error among the T trials)
+    best_indices = np.argmin(error_per_row, axis=0)
+
+    ## print the complete array of best indices (for debugging)
+    #with np.printoptions(threshold=sys.maxsize):
+    #    print("##>> best_indices:", best_indices)
+    #    print("##-------------------------------------------------------------")
+
+    best_steps = steps[best_indices]
+    best_scales = scales * best_steps[:, np.newaxis]
+    best_scales.astype(scales_dtype)
+
+    # quantize using the best scales and return
+    raw_quant = tensor / best_scales
+    if quant_is_int:
+        raw_quant = np.round(raw_quant)
+    raw_quant = np.clip(raw_quant, quant_min, quant_max).astype(quant_dtype)
+
+    return raw_quant, best_scales
+
+
+def _rotate_tensor(tensor      : np.ndarray,
+                   h_matrix    : np.ndarray,
+                   group_size  : int,
+                   ) -> np.ndarray:
     """Rotate a tensor matrix offline: T_rot = T @ H^T.
 
     For a Linear(in_features, out_features) layer with a tensor shape (out_features, in_features):
@@ -667,112 +812,38 @@ def rotate_tensor(tensor      : np.ndarray,
     return rotated_grouped.reshape(out_features, in_features)
 
 
-def to_int8(tensor: np.ndarray, *,
-            stochastic_generator: np.random.Generator | None = None
-            ) -> np.ndarray:
-    """Helper function to round scaled floats into INT8 with stochastic rounding support.
-    Args:
-        tensor               : The input array to be quantized.
-        stochastic_generator : Optional random generator for stochastic rounding.
-                               If None, standard rounding is used.
-    Returns:
-        The quantized INT8 array.
+@lru_cache(maxsize=8)
+def _build_hadamard_matrix(size: int, dtype: str = "float32") -> np.ndarray[Any, np.dtype[Any]]:
     """
-    if tensor.dtype != np.float32:
-        tensor = tensor.astype(np.float32)
-
-    if stochastic_generator is not None:
-        floor = np.floor(tensor)
-        round_noise = stochastic_generator.random(size=tensor.shape, dtype=np.float32)
-        quantized   = np.where((tensor - floor) > round_noise, floor + 1, floor)
-    else:
-        quantized = np.round(tensor)
-
-    return np.clip(quantized, -128, 127).astype(np.int8)
-
-
-def build_metadata_tensor(**metadata: Any) -> np.ndarray:
-    """Construct a UINT8 numpy tensor containing serialized metadata for ComfyUI.
-
-    This function acts as a factory, taking arbitrary keyword arguments,
-    serializing them into JSON, and returning them as a byte-based tensor
-    suitable for storage in ComfyUI or similar frameworks.
+    Build a normalized regular orthogonal Hadamard matrix.
 
     Args:
-        **metadata : Arbitrary keyword arguments that will be serialized
-                     into the resulting tensor.
+        size  : The size of the square matrix. Must be a power of 4.
+        dtype : String representation of the NumPy data type. This is passed
+                as a string to ensure compatibility with the `lru_cache` mechanism.
     Returns:
-        A 1D numpy array of type uint8 containing the encoded metadata.
+        A normalized Hadamard matrix of shape (size, size).
     """
-    # serialize the provided arguments into a JSON string and encode it
-    byte_data = json.dumps(metadata).encode("utf-8")
-    return np.frombuffer(byte_data, dtype=np.uint8)
+    if not isinstance(dtype,str):
+        raise TypeError(f"Expected dtype to be a string, got '{type(dtype).__name__}'")
 
+    if size < 4 or (size & (size - 1)) != 0 or (size.bit_length() - 1) % 2 != 0:
+        raise ValueError(f"Regular Hadamard size must be a power of 4, got {size}")
 
-def quantize_int8_rowwise(tensor: np.ndarray, *,
-                          scales_format       : PrecisionFormat,
-                          stochastic_generator: np.random.Generator,
-                          ) -> tuple[np.ndarray, np.ndarray]:
-    """Quantize a tensor to INT8 with per-row scales, supporting custom scale dtypes.
-    Args:
-        tensor              : Input array of shape [..., K] where quantization will be performed.
-        scales_format       : String representing the target dtype for the scales. Supported
-                              values are "FP16", "BF16", "FP16E", "BF16E". Any other value
-                              will be treated as FP32.
-        stochastic_generator: The `np.random.Generator` used when stochastic rounding is needed.
-    Returns:
-        A tuple containing:
-            - quantized_int8: An INT8 array with the same shape as the input tensor.
-            - scales        : Array containing per-row scales with shape [..., 1], casted
-                              to the specified `scales_format`.
-    """
-    if tensor.dtype != np.float32:
-        tensor = tensor.astype(np.float32)
+    # base hadamard matrix of order 4,
+    # in this specific construction, every row and column sums to exactly 2
+    H4 = np.array([ [ 1,  1,  1, -1],
+                    [ 1,  1, -1,  1],
+                    [ 1, -1,  1,  1],
+                    [-1,  1,  1,  1]  ], dtype=np.dtype(dtype))
+    # iteratively build the full hadamard matrix using the kronecker product
+    H, current_size = H4, 4
+    while current_size < size:
+        H = np.kron(H, H4)
+        current_size *= 4
 
-    # calculate absolute maximum per row to calculate scales
-    abs_maximum = np.max(np.abs(tensor), axis=-1, keepdims=True)
-    scales = np.maximum(abs_maximum / 127.0, FP32_EPSILON)
+    return H / np.sqrt(size, dtype=np.dtype(dtype))
 
-    # scale tensor and quantize it
-    quantized_int8 = to_int8(tensor / scales, stochastic_generator=stochastic_generator)
-
-    # apply type casting to scales if requested by the `scales_format` parameter
-    if scales_format.upper() in ("FP16", "BF16", "FP16E", "BF16E"):
-        # these 3 steps are required because cast_tensor returns a dict instead of the raw tensor
-        TENSOR_NAME = "scales"
-        tensor_dict = cast_tensor(TENSOR_NAME, scales,
-                                  cast_to              = scales_format,
-                                  scales_format        = scales_format,
-                                  fp8_preloaded_scales = None,
-                                  stochastic_generator = stochastic_generator)
-        scales      = tensor_dict[TENSOR_NAME]
-
-    return quantized_int8, scales
-
-
-def quantize_int8_convrot(tensor: np.ndarray,
-                          *,
-                          group_size           : int,
-                          scales_format        : PrecisionFormat,
-                          stochastic_generator : np.random.Generator,
-                          ) -> tuple[np.ndarray, np.ndarray]:
-    """Perform a ConvRot tensor rotation followed by row-wise INT8 quantization.
-    Args:
-        tensor: The input tensor array.
-        group_size: Size of the group for rotation.
-        scales_format       : String representing the target dtype for the scales. Supported
-                              values are "FP16", "BF16", "FP16E", "BF16E", and "FP32".
-                              Any other value will be treated as FP32.
-        stochastic_generator: The `np.random.Generator` used when stochastic rounding is needed.
-    Returns:
-        A tuple containing:
-            - quantized_int8: An INT8 array resulting from the rotation and quantization process.
-            - scales        : Array containing per-row scales with shape [..., 1], casted
-                              to the specified `scales_format`.
-    """
-    h_matrix = build_hadamard(group_size)
-    rotated_tensor = rotate_tensor(tensor, h_matrix, group_size)
-    return quantize_int8_rowwise(rotated_tensor, scales_format=scales_format, stochastic_generator=stochastic_generator)
 
 
 #============================= PROCESS TENSORS =============================#
@@ -885,8 +956,9 @@ def cast_tensor(tensor_name: str,
                 *,
                 cast_to             : str,
                 scales_format       : PrecisionFormat,
-                fp8_preloaded_scales: dict[str,str] | None,
+                scales_search_trials: int,
                 stochastic_generator: np.random.Generator,
+                fp8_preloaded_scales: dict[str,str] | None = None,
                 ) -> dict:
     """
     Cast a tensor to a target dtype, optionally using stochastic rounding.
@@ -949,7 +1021,11 @@ def cast_tensor(tensor_name: str,
             f"{parent}.scale_input" : scale_input }
 
     elif cast_to == "INT8CONVROT":
-        quantized_int8, scales = quantize_int8_convrot(tensor, group_size=CONVROT_GROUP_SIZE, scales_format=scales_format, stochastic_generator=stochastic_generator)
+        quantized_int8, scales = quantize_int8_convrot(tensor,
+                                                       group_size           = CONVROT_GROUP_SIZE,
+                                                       scales_format        = scales_format,
+                                                       scales_search_trials = scales_search_trials,
+                                                       stochastic_generator = stochastic_generator)
         comfy_quant = build_metadata_tensor( format="int8_tensorwise", convrot=True, convrot_groupsize=CONVROT_GROUP_SIZE )
         return {
             f"{tensor_name}"       : quantized_int8,
@@ -971,8 +1047,9 @@ def convert_safetensors_file(input_safetensors_file: Path,
                              target_format        : TargetFormat,
                              scales_format        : PrecisionFormat | None     = None,
                              high_precision_format: PrecisionFormat | None     = None,
-                             fp8_preloaded_scales : dict[str,str] | None       = None,
+                             scales_search_trials : int | None                 = None,
                              stochastic_generator : np.random.Generator | None = None,
+                             fp8_preloaded_scales : dict[str,str] | None       = None,
                              tensor_mapper        : Callable | None            = None,
                              clamp_limit          : float | None               = None,
                              clamp_sharpness      : float | None               = None,
@@ -1021,7 +1098,6 @@ def convert_safetensors_file(input_safetensors_file: Path,
     if high_precision_format not in PRECISION_FORMAT_VALUES:
         raise ValueError(f"Invalid `high_precision_format` value: {high_precision_format}")
 
-
     # initialize the stochastic generator if it's not provided
     if stochastic_generator is None:
         stochastic_generator = np.random.default_rng()
@@ -1060,8 +1136,9 @@ def convert_safetensors_file(input_safetensors_file: Path,
             out_tensor_dict = cast_tensor(tensor_name, tensor,
                                           cast_to              = cast_to,
                                           scales_format        = scales_format,
-                                          fp8_preloaded_scales = fp8_preloaded_scales,
-                                          stochastic_generator = stochastic_generator)
+                                          scales_search_trials = scales_search_trials or 0,
+                                          stochastic_generator = stochastic_generator,
+                                          fp8_preloaded_scales = fp8_preloaded_scales)
 
             # convert casted tensor to bytes and store them in `output_rawtensor_file`
             for out_tensor_name, out_tensor in out_tensor_dict.items():
@@ -1253,6 +1330,9 @@ def main(parent_args  : list[str] | None = None,
                                       help="Quantize aggressively for faster speeds at the cost of some quality.")
     precision_main_group.add_argument('--iscales', type=Path, metavar='FILE',
                                       help="Path to a file containing precalculated input scales (only valid with --fp8scaled).")
+    precision_main_group.add_argument('--scales-trials', type=int, metavar='NUMBER',
+                                      help="Number of candidate scales to try (only valid with --int8convrot).")
+
 
 
     #-- Metadata options group ------------------
@@ -1274,18 +1354,27 @@ def main(parent_args  : list[str] | None = None,
 
     args = parser.parse_args(parent_args)
 
+    # determine target data type
+    target_format = cast(TargetFormat, args.dtype)
+    req_quantization, _, dtype_tag, _ = TARGET_FORMAT_INFO[target_format]
+
     # verify '--iscales' is provided only when '--fp8scaled' is selected
     if args.iscales and args.dtype != 'FP8SCALED':
         parser.error("The --iscales argument can only be used when '--fp8scaled' is selected as the quantization option.")
+
+    # handle "--scales-trials" setting scales_search_trials only when '--int8convrot' was selected
+    scales_search_trials = 0
+    if args.scales_trials:
+        if target_format == 'INT8CONVROT':
+            scales_search_trials = args.scales_trials
+        else:
+            parser.error("The --scales-trials argument can only be used when 'INT8CONVROT' is selected as the quantization option.")
 
     # check input files and determine model class
     input_files      = validate_and_collect_safetensors(args.input_files)
     input_file_count = len(input_files)
     model = detect_model_architecture(input_files)
 
-    # determine target data type
-    target_format = cast(TargetFormat, args.dtype)
-    req_quantization, _, dtype_tag, _ = TARGET_FORMAT_INFO[target_format]
 
     # load the "iscales" file if required by the user
     iscales, iscales_tag = None, ""
@@ -1309,6 +1398,7 @@ def main(parent_args  : list[str] | None = None,
         mixed_tag     = f"_{mixed_format.lower()}mixed"
         scales_tag    = f"_{scales_format.lower()}qs" if scales_format != 'FP32' else ""
     else:
+        mixed_small   = False
         mixed_format  = None
         scales_format = None
         quality_tag   = ""
@@ -1320,7 +1410,6 @@ def main(parent_args  : list[str] | None = None,
             warning("--mixed-dtype is only supported for quantized models, it will be ignored")
         if args.scales_dtype is not None:
             warning("--scales-dtype is only supported for quantized models, it will be ignored")
-
 
     # determine the clamp parameters (if any)
     clamp_limit, clamp_sharpness = None, None
@@ -1370,6 +1459,8 @@ def main(parent_args  : list[str] | None = None,
         message(f"Mixed Data Type  : {mixed_format.upper()}{ ' (SMALL)' if mixed_small else '' }")
     if scales_format is not None:
         message(f"Scales Data Type : {scales_format.upper()}")
+    if scales_search_trials:
+        message(f"Scales Searches  : {scales_search_trials}")
     message(f"Clamping Value   : {clamp_limit_str}")
     message(f"Stochastic Seed  : {args.seed}")
     message(f"Input            : {input_file_count} safetenstensors {'file' if input_file_count == 1 else 'files'}")
@@ -1407,8 +1498,9 @@ def main(parent_args  : list[str] | None = None,
                                         target_format         = target_format,
                                         scales_format         = scales_format,
                                         high_precision_format = mixed_format,
-                                        fp8_preloaded_scales  = iscales,
+                                        scales_search_trials  = scales_search_trials,
                                         stochastic_generator  = stochastic_generator,
+                                        fp8_preloaded_scales  = iscales,
                                         clamp_limit           = clamp_limit,
                                         clamp_sharpness       = clamp_sharpness,
                                         tensor_mapper         = tensor_mapper,
